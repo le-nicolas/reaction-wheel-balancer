@@ -41,6 +41,9 @@ Export firmware parameters:
 python final/export_firmware_params.py --mode smooth
 ```
 
-## Notes
+## Where To Go Next
 
-- Benchmark result images (`final/results/*.png`) are tracked; raw CSV/TXT benchmark dumps are ignored.
+- Non-technical overview and explanation: `final/README.md`
+- Mechanical/physics model file: `final/final.xml`
+- Controller runtime: `final/final.py`
+- ESP32-oriented integration notes: `final/firmware/README.md`

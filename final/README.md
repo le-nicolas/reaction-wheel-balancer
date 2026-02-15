@@ -1,144 +1,140 @@
-# Reaction Wheel Balancer (Non-Technical Guide)
+# Final Folder Guide (For Non-Technical Readers)
 
-This folder contains a simulated self-balancing robot built in MuJoCo.
+This folder is the "main demo" of the project.
 
-If you are not an engineer, think of it like this:
-- A body is trying to stand up.
-- A spinning wheel inside it can create balancing torque.
-- A sliding base can move under it to help catch falls.
-- Software constantly measures motion and adjusts motors many times per second.
+It simulates a self-balancing robot in MuJoCo and shows how software can keep a robot upright using a reaction wheel and a moving base.
 
-## What This Is
+## 1) What This Is
 
-This is a digital twin of a balancing robot that uses:
-- a base body/wheel,
-- a stick-like upper body,
-- a reaction wheel,
-- and a controller that tries to keep it upright.
+In simple terms, this robot is like a broom trying to stand upright on your hand:
+- the **stick** wants to fall,
+- the **reaction wheel** inside can twist the body back,
+- the **base** can slide to catch the fall,
+- the controller repeats this many times per second.
 
-You can run it, push it, and compare different control modes.
+Key files:
+- Simulation + controller: `final/final.py`
+- Mechanical model (geometry, joints, actuators): `final/final.xml`
+- ESP32 firmware notes: `final/firmware/README.md`
 
-Main runtime file:
-- `final/final.py`
+## 2) Mechanical Design (Why the Geometry Helps It Balance)
 
-Main model file:
-- `final/final.xml`
+### Main parts
+- **Base body / wheel area**: lower body that contacts terrain.
+- **Base X/Y slide joints**: lets the base shift under the robot.
+- **Stick body**: upright mass that must be stabilized.
+- **Reaction wheel**: spinning rotor that creates corrective torque.
 
-## How the Mechanical Design Works
+### Why this geometry works
+- The stick has mass above the base, so gravity creates a tipping moment.
+- The reaction wheel can create fast opposite torque without moving the whole base first.
+- If wheel speed gets too high, the base can move to reduce required wheel momentum.
+- That gives two balancing tools:
+  1. rotational correction (reaction wheel),
+  2. translational correction (base motion).
 
-### Parts and roles
-- Base body/wheel: the lower mass that contacts terrain.
-- Base X/Y slides: let the base shift sideways to assist balance.
-- Stick body: the upright part that must be stabilized.
-- Reaction wheel: spins to generate equal-and-opposite torque.
+### Geometry types in the XML
+- **Dynamics-critical geometry**: affects mass/inertia/contact.
+- **Visual-only geometry**: for appearance only (`mass="0"`, no collision contribution).
 
-### Why this geometry can balance
-- The stick has a center of mass above the base, so gravity tends to tip it.
-- The reaction wheel can quickly create corrective torque.
-- The sliding base can move under the stick to recover when wheel momentum gets high.
-- The combination gives two recovery mechanisms: rotational (wheel) and translational (base).
+This separation is intentional: you can improve look/shape without silently breaking control physics.
 
-### Visual-only vs dynamics-critical geometry
-In `final.xml`:
-- Dynamics-critical geoms carry mass and/or collision influence.
-- Visual-only geoms use `mass="0"` and `contype="0" conaffinity="0"`.
+## 3) Physics in Plain English (with Light Math)
 
-That separation keeps appearance flexible without breaking physics.
+These are the key ideas behind balancing:
 
-## Physics in Simple Terms
-
-A few key equations drive the behavior:
-
-- Torque-acceleration link:
+- Torque drives angular acceleration:
   - `tau = I * alpha`
-  - More torque (`tau`) gives more angular acceleration (`alpha`) for inertia `I`.
+- Angular momentum of wheel:
+  - `L = I_w * omega_w`
+- Equal/opposite torque effect:
+  - accelerating wheel one way pushes body the other way.
 
-- Wheel reaction effect:
-  - If the reaction wheel accelerates one way, the body feels opposite torque.
-
-- Control update law (simplified):
-  - `du = -K * [x; u_prev]`
-  - `u = clip(u_prev + du)`
+For small tilt angles, an inverted pendulum can be approximated as:
+- `theta_ddot ≈ (g/l) * theta + (tau_control / I_body)`
 
 Where:
-- `x` is the estimated state (angles, rates, base motion, wheel speed),
-- `u` is motor command,
-- `K` is controller gain,
-- `clip` enforces safe limits.
+- `theta` = tilt angle,
+- `g` = gravity,
+- `l` = center-of-mass height,
+- `tau_control` = motor-generated correction torque.
 
-Terrain friction and contact also matter: traction changes how effectively base motion can recover balance.
+Terrain friction matters too: if contact is poor, base motion helps less.
 
-## Control Law (What the software does every cycle)
+## 4) Control Law (How Software Actually Stabilizes It)
 
-Each control cycle in `final.py` does:
-1. Read noisy, sensor-like measurements.
-2. Update a state estimate (Kalman-style correction).
-3. Compute command increments with delta-u LQR.
-4. Apply safety shaping and actuator limits.
-5. Send commands, simulate one step, repeat.
+Every control update in `final/final.py` does:
+1. Measure noisy sensor channels (IMU/encoder-like signals).
+2. Estimate current state (Kalman correction).
+3. Compute command increment using delta-u LQR.
+4. Apply saturation/rate limits and safety logic.
+5. Send commands to MuJoCo actuators.
 
-Safety shaping includes:
-- wheel speed budget and high-spin handling,
-- base authority gating near upright/recovery phases,
-- motor torque/slew/rate limits,
-- crash-angle protection.
+Core control form:
+- `du = -K * [x; u_prev]`
+- `u = clip(u_prev + du)`
 
-## Why This Is Close to Real Life
+This means it does not jump directly to giant commands; it adjusts smoothly while respecting limits.
 
-The simulator includes practical effects used in real robots:
-- Control rate scheduling (`control_hz`) separate from physics timestep.
-- Command delay queue (`control_delay_steps`).
-- Sensor noise (IMU angle/rate, wheel encoder, base position/velocity noise).
-- Actuator saturation and motor envelope limits.
-- Crash thresholds and stop-on-crash behavior.
+Safety layers include:
+- wheel speed budget and high-spin recovery latch,
+- base authority gating,
+- actuator slew/torque limits,
+- crash-angle stop logic.
 
-So this is not just “perfect physics + perfect sensors”.
+## 5) Why This Is Close to Real Life
 
-## ESP32 Relevance
+The simulation intentionally includes real-world effects:
+- control loop rate separate from physics timestep,
+- command delay queue,
+- IMU/wheel/base sensor noise,
+- motor envelope and saturation limits,
+- crash thresholds and stop-on-crash behavior.
 
-This project has a firmware-oriented path for ESP32 in `final/firmware/`.
+So the controller is not tuned on a perfect/noiseless world.
 
-How simulation maps to embedded control:
-- Fixed-rate outer loop (estimator + controller + guards).
-- Inner motor/current loop handled by motor driver stack.
-- Safety checks and latches mirror embedded expectations.
+## 6) ESP32 Relevance
 
-Useful files:
-- `final/firmware/README.md`
-- `final/export_firmware_params.py`
-- `final/test_export_parity.py`
+This project is structured so simulation logic maps to embedded firmware flow:
+- fixed-rate estimator/controller loop,
+- actuator guardrails,
+- deterministic exported parameters.
 
-Parameter export keeps simulation and firmware constants aligned.
+Important files:
+- `final/export_firmware_params.py` (exports controller params)
+- `final/test_export_parity.py` (checks export/runtime consistency)
+- `final/firmware/README.md` (integration notes for embedded side)
 
-## Run It on Your Laptop / PC
+For ESP32 bring-up, the same safety mindset is used: bounded commands, watchdog-like checks, and conservative modes.
 
-### Requirements
-- Python 3.10+ (recommended)
-- A working graphics environment for MuJoCo viewer
+## 7) Run It on Your Laptop / PC
 
-Install dependencies:
+Requirements:
+- Python 3.10+
+- GPU/display environment for MuJoCo viewer
+
+Install:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Run the simulator:
+Run default smooth mode:
 
 ```bash
 python final/final.py --mode smooth
 ```
 
-Try robust mode:
+Run robust profile:
 
 ```bash
 python final/final.py --mode robust --stability-profile low-spin-robust
 ```
 
-### Play mode ideas
-Apply scripted push forces:
+Try push disturbance:
 
 ```bash
-python final/final.py --mode smooth --push-x 4.0 --push-start-s 1.0 --push-duration-s 0.15
+python final/final.py --mode smooth --push-x 4 --push-start-s 1.0 --push-duration-s 0.15
 ```
 
 Try hardware-like constraints:
@@ -147,14 +143,12 @@ Try hardware-like constraints:
 python final/final.py --mode robust --real-hardware
 ```
 
-## Known Limitations
+## 8) Known Limits
 
-- It is still a simulation, not a full physical prototype.
-- Contact/friction and sensor models are approximations.
-- Real hardware needs integration, calibration, and safety validation.
+- This is still a simulation, not a certified hardware safety system.
+- Contact/friction/sensor models are approximations.
+- Real hardware requires calibration, safety interlocks, and staged testing.
 
-## Where to look next
+---
 
-- Runtime/controller: `final/final.py`
-- Mechanical/scene model: `final/final.xml`
-- Firmware integration notes: `final/firmware/README.md`
+If you only read one file first, read `final/README.md` (this file), then open `final/final.py` and `final/final.xml` side-by-side.
