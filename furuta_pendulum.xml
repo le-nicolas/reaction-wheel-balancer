@@ -1,0 +1,77 @@
+<mujoco model="furuta_pendulum">
+    <compiler angle="radian" coordinate="local"/>
+    <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+    <default>
+        <joint damping="0.01"/>
+        <geom friction="0.5 0.5 0.5"/>
+    </default>
+    
+<keyframe>
+    <!-- Hanging down -->
+    <key name="down"
+         qpos="0 0"
+         qvel="0 0"/>
+
+    <!-- Near upright -->
+    <key name="upright"
+         qpos="0 3.1416"
+         qvel="0 0"/>
+</keyframe>
+
+    <worldbody>
+
+        <!-- Base -->
+        <body name="base" pos="0 0 0">
+            <geom type="cylinder" size="0.05 0.02" rgba="0.3 0.3 0.3 1"/>
+
+            <!-- Rotary Arm -->
+            <body name="arm" pos="0 0 0.02">
+                <joint name="arm_joint"
+                        type="hinge"
+                        axis="0 0 1"
+                        limited="true"
+                        range="-6.283 6.283"
+                        armature="0"/>
+
+                <geom type="capsule"
+                      fromto="0 0 0 0.25 0 0"
+                      size="0.01"
+                      rgba="0.2 0.2 0.8 1"/>
+
+                <!-- Pendulum -->
+                <body name="pendulum" pos="0.25 0 0">
+                    <joint name="pendulum_joint"
+                           type="hinge"
+                           axis="1 0 0"
+                           limited="true"
+                           range="-3.1416 3.1416"/>
+
+                    <geom type="capsule"
+                          fromto="0 0 0 0 0 -0.3"
+                          size="0.01"
+                          rgba="0.8 0.2 0.2 1"/>
+
+                </body>
+
+                <inertial pos="0.125 0 0"
+                          mass="0.1"
+                          diaginertia="0.002 0.002 0.0002"/>
+            </body>
+        </body>
+    </worldbody>
+
+    <actuator>
+        <motor joint="arm_joint"
+               ctrlrange="-12 12"
+               gear="1"/>
+    </actuator>
+
+    <sensor>
+        <jointpos joint="arm_joint"/>
+        <jointvel joint="arm_joint"/>
+        <jointpos joint="pendulum_joint"/>
+        <jointvel joint="pendulum_joint"/>
+    </sensor>
+
+</mujoco>

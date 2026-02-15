@@ -1,0 +1,93 @@
+<mujoco model="wheel_on_stick">
+    <option timestep="0.001" gravity="0 0 -9.81"/>
+
+    <visual>
+        <map znear="0.001" zfar="50"/>
+    </visual>
+
+    <worldbody>
+
+        <!-- Ground -->
+        <geom type="plane" size="100 100 0.1" rgba="0.9 0.9 0.9 1" friction="2.0 0.02 0.001"/>
+
+        <!-- Camera -->
+        <camera name="side"
+                pos="0 -4 1.5"
+                quat="0.9239 0.3827 0 0"/>
+
+        <!-- Base cart -->
+        <body name="base" pos="0 0 0.10">
+
+            <!-- Cart translation (horizontal X-axis) -->
+            <joint name="base_wheel"
+                   type="slide"
+                   axis="1 0 0"
+                   damping="0.1"
+                   limited="true"
+                   range="-5 5"/>
+
+            <geom type="cylinder"
+                  size="0.15 0.05"
+                  mass="0.5"
+                  quat="0.7071 0 0.7071 0"
+                  friction="2.0 0.2 0.001"
+                  solref="0.002 1"
+                  solimp="0.9 0.95 0.001"/>
+
+            <!-- Stick -->
+            <body name="stick" pos="0 0 0.10">
+                <joint name="stick_hinge"
+                       type="hinge"
+                       axis="0 1 0"
+                       range="-3.14 3.14"
+                       damping="2.0"
+                       stiffness="0"/>
+
+                <geom type="capsule"
+                      fromto="0 0 0  0 0 0.8"
+                      mass="1.0"
+                      size="0.04"/>
+
+                <!-- Reaction wheel -->
+                <body name="wheel" pos="0 0 0.6">
+                    <joint name="wheel_spin"
+                           type="hinge"
+                           axis="0 1 0"
+                           damping="0.5"
+                           limited="true"
+                           range="-200 200"/>
+
+                    <geom type="cylinder"
+                          size="0.25 0.03"
+                          mass="1.0"
+                          quat="0.7071 0.7071 0 0"/>
+
+                    <geom type="sphere"
+                          size="0.05"
+                          rgba="0.3 0.2 0.2 1"/>
+                </body>
+            </body>
+        </body>
+    </worldbody>
+
+    <!-- Actuators -->
+    <actuator>
+        <!-- Reaction wheel motor -->
+        <motor name="wheel_spin"
+               joint="wheel_spin"
+               ctrlrange="-2000 2000"
+               gear="1"/>
+
+        <!-- Base cart motor (force) -->
+        <motor name="base_wheel"
+               joint="base_wheel"
+               ctrlrange="-100 100"
+               gear="1"/>
+
+        <!-- abstract base torque (rider steering) -->
+        <motor name="stick_hinge"
+               joint="stick_hinge"
+               ctrlrange="-200 200"
+               gear="1"/>
+    </actuator>
+</mujoco>

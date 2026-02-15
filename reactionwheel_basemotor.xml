@@ -1,0 +1,61 @@
+<mujoco model="wheel_on_stick">
+    <option timestep="0.001" gravity="0 0 -9.81"/>
+
+    <visual>
+        <map znear="0.001" zfar="50"/>
+    </visual>
+
+    <worldbody>
+        <!-- Camera -->
+        <camera name="side"
+                pos="0 -4 1.5"
+                quat="0.9239 0.3827 0 0"/>
+
+        <!-- Stick -->
+        <body name="stick" pos="0 0 0.3">
+            <joint name="stick_hinge"
+                   type="hinge"
+                   axis="0 1 0"
+                   damping="0.5"/>
+
+            <geom type="capsule"
+                  fromto="0 0 0  0 0 2"
+                  mass="1.0"
+                  size="0.05"
+                  contype="0"
+                  conaffinity="0"/>
+
+            <!-- Reaction Wheel -->
+            <body name="wheel" pos="0 0 2">
+                <joint name="wheel_spin"
+                       type="hinge"
+                       axis="0 1 0"
+                       damping="0.0"/>
+
+                <!-- Rim -->
+                <geom type="cylinder"
+                      size="0.3 0.02"
+                      mass="3.0"
+                      quat="0.7071 0.7071 0 0"
+                      contype="0"
+                      conaffinity="0"/>
+
+                <!-- Hub -->
+                <geom type="sphere"
+                      size="0.07"
+                      rgba="0.2 0.2 0.2 1"/>
+            </body>
+        </body>
+    </worldbody>
+
+    <!-- Actuators -->
+    <actuator>
+        <!-- Reaction wheel motor -->
+        <motor joint="wheel_spin"
+               ctrlrange="-1000 1000"/>
+
+        <!-- Base (stick hinge) motor -->
+        <motor joint="stick_hinge"
+               ctrlrange="-200 200"/>
+    </actuator>
+</mujoco>
