@@ -1,5 +1,7 @@
 # Reaction Wheel Balancer (Non-Technical Guide)
 
+good for modeling and deriving firmware parameters, but treat it as pre-deployment logic, not final safety-certified hardware control.
+
 
 
 https://github.com/user-attachments/assets/586ee1d3-beb5-460e-8ca5-f6c0afe3e5ce

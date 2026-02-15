@@ -1,5 +1,7 @@
 # Final Folder Guide (For Non-Technical Readers)
 
+good for modeling and deriving firmware parameters, but treat it as pre-deployment logic, not final safety-certified hardware control.
+
 This folder is the "main demo" of the project.
 
 It simulates a self-balancing robot in MuJoCo and shows how software can keep a robot upright using a reaction wheel and a moving base.
