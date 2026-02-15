@@ -1,49 +1,169 @@
-# Mujoco-series
+# Reaction Wheel Balancer (Non-Technical Guide)
 
-MuJoCo experiments for balancing and reaction-wheel control, including:
-- simulation controllers and model variants
-- benchmarking scripts
-- firmware-oriented parameter export under `final/firmware/`
+This project simulates a self-balancing robot in MuJoCo.
 
-## Start Here
+In simple terms:
+- the robot body wants to fall,
+- a spinning wheel inside creates balancing torque,
+- the base can move under the body to help catch the fall,
+- software repeats this correction loop many times per second.
 
-The main showcase is the final controller stack in `final/`.
+## What This Is
 
-If you want a plain-English walkthrough of what this robot is, why it balances, how the control law works, and how to run it on your own PC:
-- read `final/README.md`
+This is a digital twin of a balancing robot with:
+- a base body / wheel area,
+- a stick-like upper body,
+- a reaction wheel,
+- and a controller that tries to keep it upright.
 
-## Quick Start
+You can run it, push it, switch modes, and inspect how close the behavior is to real life constraints.
 
-1. Create and activate a virtual environment.
-2. Install dependencies:
+## Mechanical Design (Why the Geometry Can Balance)
+
+### Main parts
+- **Base body / wheel area**: lower structure that contacts terrain.
+- **Base X/Y slide joints**: allows base translation to assist stability.
+- **Stick body**: upright mass that needs stabilization.
+- **Reaction wheel**: spinning rotor used to generate corrective torque.
+
+### Why this geometry works
+- The stick has mass above the base, so gravity creates a tipping tendency.
+- The reaction wheel can rapidly apply opposite torque to fight tilt.
+- The sliding base can shift under the robot when wheel momentum gets high.
+- So balancing is done with two tools:
+  1. rotational correction (reaction wheel),
+  2. translational correction (base movement).
+
+### Visual-only vs physics-critical geometry
+In `final/final.xml`:
+- **Physics-critical geometry** affects mass/inertia/contact.
+- **Visual-only geometry** has `mass="0"` and collision disabled (`contype="0"`, `conaffinity="0"`).
+
+This separation keeps visuals flexible without accidentally changing control dynamics.
+
+## Physics in Simple Terms (Light Math)
+
+Key equations used by this kind of balancing system:
+
+- Torque/acceleration relationship:
+  - `tau = I * alpha`
+- Wheel angular momentum:
+  - `L = I_w * omega_w`
+- Equal/opposite torque effect:
+  - accelerating the wheel one direction pushes the body the opposite direction.
+
+Small-angle intuition for inverted pendulum behavior:
+- `theta_ddot ≈ (g/l) * theta + (tau_control / I_body)`
+
+Where:
+- `theta` is tilt angle,
+- `g` is gravity,
+- `l` is center-of-mass height,
+- `tau_control` is commanded corrective torque.
+
+Contact and friction from terrain also matter because base translation depends on grip.
+
+## Control Law (What the Software Does)
+
+Each control update cycle in `final/final.py` does:
+1. Read noisy sensor-like measurements.
+2. Estimate state using a Kalman-style correction.
+3. Compute control increment with delta-u LQR.
+4. Apply safety shaping and command limits.
+5. Send actuator commands and step simulation.
+
+Core control form:
+- `du = -K * [x; u_prev]`
+- `u = clip(u_prev + du)`
+
+Meaning:
+- the controller adjusts commands incrementally,
+- commands are clipped to safe bounds,
+- wheel/base actuation are coordinated.
+
+Safety logic includes:
+- wheel speed budget and high-spin latch behavior,
+- base authority gating,
+- actuator saturation/rate limiting,
+- crash-angle handling.
+
+## Why It Is Close to Real Life
+
+The simulator includes practical constraints, not just ideal physics:
+- control loop frequency (`control_hz`) separate from physics timestep,
+- command delay queue (`control_delay_steps`),
+- sensor noise (IMU + wheel encoder + base estimate noise),
+- actuator saturation and motor envelope limits,
+- crash thresholds and stop-on-crash behavior.
+
+So tuning is done under imperfect sensing/actuation assumptions.
+
+## ESP32 Relevance
+
+The project is structured to map cleanly to embedded control flow on ESP32-like systems:
+- fixed-rate estimator + controller outer loop,
+- deterministic guardrails and fault handling,
+- parameter export parity between simulation and firmware.
+
+Important files:
+- `final/firmware/README.md`
+- `final/export_firmware_params.py`
+- `final/test_export_parity.py`
+
+This makes it easier to move from sim behavior to firmware implementation with fewer surprises.
+
+## Run It on Your Laptop / PC
+
+Requirements:
+- Python 3.10+
+- Graphics/display environment for MuJoCo viewer
+
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Run the main controller:
+Run default mode:
 
 ```bash
 python final/final.py --mode smooth
 ```
 
-## Useful Commands
+Run robust mode:
 
-Run exporter parity test:
+```bash
+python final/final.py --mode robust --stability-profile low-spin-robust
+```
+
+Play with scripted push disturbance:
+
+```bash
+python final/final.py --mode smooth --push-x 4 --push-start-s 1.0 --push-duration-s 0.15
+```
+
+Try hardware-like constraints:
+
+```bash
+python final/final.py --mode robust --real-hardware
+```
+
+Useful checks:
 
 ```bash
 python final/test_export_parity.py
-```
-
-Export firmware parameters:
-
-```bash
 python final/export_firmware_params.py --mode smooth
 ```
 
-## Where To Go Next
+## Known Limitations
 
-- Non-technical overview and explanation: `final/README.md`
-- Mechanical/physics model file: `final/final.xml`
-- Controller runtime: `final/final.py`
-- ESP32-oriented integration notes: `final/firmware/README.md`
+- This is still a simulation, not a certified safety controller.
+- Contact, friction, and sensor models are approximations.
+- Real hardware still needs calibration, staged testing, and safety interlocks.
+
+## Project Files (Quick Map)
+
+- Main runtime/controller: `final/final.py`
+- Mechanical/scene model: `final/final.xml`
+- Firmware notes: `final/firmware/README.md`
+- Non-technical final-folder copy: `final/README.md`
