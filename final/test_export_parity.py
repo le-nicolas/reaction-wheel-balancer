@@ -25,21 +25,12 @@ def reference_bundle(args: argparse.Namespace):
     p_aug = solve_discrete_are(a_aug, b_aug, q_aug, cfg.r_du)
     k_du = np.linalg.inv(b_aug.T @ p_aug @ b_aug + cfg.r_du) @ (b_aug.T @ p_aug @ a_aug)
 
-    c = runtime.build_partial_measurement_matrix()
+    c = runtime.build_partial_measurement_matrix(cfg)
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
     control_dt = control_steps * model.opt.timestep
     wheel_lsb = (2.0 * np.pi) / (cfg.wheel_encoder_ticks_per_rev * control_dt)
     qn = np.diag([1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5])
-    wheel_var = (wheel_lsb**2) / 12.0 + cfg.wheel_encoder_rate_noise_std_rad_s**2
-    rn = np.diag(
-        [
-            cfg.imu_angle_noise_std_rad**2,
-            cfg.imu_angle_noise_std_rad**2,
-            cfg.imu_rate_noise_std_rad_s**2,
-            cfg.imu_rate_noise_std_rad_s**2,
-            wheel_var,
-        ]
-    )
+    rn = runtime.build_measurement_noise_cov(cfg, wheel_lsb)
     l = runtime.build_kalman_gain(a, qn, c, rn)
 
     return {

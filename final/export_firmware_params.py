@@ -48,6 +48,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imu-angle-noise-deg", type=float, default=0.25)
     parser.add_argument("--imu-rate-noise", type=float, default=0.02)
     parser.add_argument("--wheel-rate-noise", type=float, default=0.01)
+    parser.add_argument("--base-pos-noise", type=float, default=0.0015)
+    parser.add_argument("--base-vel-noise", type=float, default=0.03)
     parser.add_argument("--legacy-model", action="store_true", help="Disable hardware-realistic timing/noise model.")
     parser.add_argument(
         "--max-wheel-speed",
@@ -174,21 +176,12 @@ def compute_export_bundle(args: argparse.Namespace) -> dict[str, Any]:
     p_aug = solve_discrete_are(a_aug, b_aug, q_aug, cfg.r_du)
     k_du = np.linalg.inv(b_aug.T @ p_aug @ b_aug + cfg.r_du) @ (b_aug.T @ p_aug @ a_aug)
 
-    c = runtime.build_partial_measurement_matrix()
+    c = runtime.build_partial_measurement_matrix(cfg)
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
     control_dt = control_steps * model.opt.timestep
     wheel_lsb = (2.0 * np.pi) / (cfg.wheel_encoder_ticks_per_rev * control_dt)
     qn = np.diag([1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5])
-    wheel_var = (wheel_lsb**2) / 12.0 + cfg.wheel_encoder_rate_noise_std_rad_s**2
-    rn = np.diag(
-        [
-            cfg.imu_angle_noise_std_rad**2,
-            cfg.imu_angle_noise_std_rad**2,
-            cfg.imu_rate_noise_std_rad_s**2,
-            cfg.imu_rate_noise_std_rad_s**2,
-            wheel_var,
-        ]
-    )
+    rn = runtime.build_measurement_noise_cov(cfg, wheel_lsb)
     l = runtime.build_kalman_gain(a, qn, c, rn)
 
     if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b)) and np.all(np.isfinite(k_du)) and np.all(np.isfinite(l))):
@@ -292,6 +285,8 @@ def render_header(bundle: dict[str, Any], args: argparse.Namespace) -> str:
     lines.append(
         f"static const float CTRL_WHEEL_RATE_NOISE_STD_RAD_S = {_fmt_num(cfg.wheel_encoder_rate_noise_std_rad_s)};"
     )
+    lines.append(f"static const float CTRL_BASE_POS_NOISE_STD_M = {_fmt_num(cfg.base_encoder_pos_noise_std_m)};")
+    lines.append(f"static const float CTRL_BASE_VEL_NOISE_STD_M_S = {_fmt_num(cfg.base_encoder_vel_noise_std_m_s)};")
     lines.append(
         f"static const float CTRL_WHEEL_ENCODER_TICKS_PER_REV = {_fmt_num(float(cfg.wheel_encoder_ticks_per_rev))};"
     )

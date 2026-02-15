@@ -118,6 +118,36 @@ class ControllerEvaluator:
         dtype=float,
     )
 
+    @staticmethod
+    def _solve_discrete_are_robust(
+        A: np.ndarray,
+        B: np.ndarray,
+        Q: np.ndarray,
+        R: np.ndarray,
+        label: str,
+    ) -> np.ndarray:
+        reg_steps = (0.0, 1e-12, 1e-10, 1e-8, 1e-6)
+        eye = np.eye(R.shape[0], dtype=float)
+        last_exc: Exception | None = None
+        for eps in reg_steps:
+            try:
+                P = solve_discrete_are(A, B, Q, R + eps * eye)
+                if np.all(np.isfinite(P)):
+                    return 0.5 * (P + P.T)
+            except Exception as exc:
+                last_exc = exc
+        raise RuntimeError(f"{label} DARE failed after regularization fallback: {last_exc}") from last_exc
+
+    @staticmethod
+    def _solve_linear_robust(gram: np.ndarray, rhs: np.ndarray, label: str) -> np.ndarray:
+        try:
+            return np.linalg.solve(gram, rhs)
+        except np.linalg.LinAlgError:
+            sol, *_ = np.linalg.lstsq(gram, rhs, rcond=None)
+            if not np.all(np.isfinite(sol)):
+                raise RuntimeError(f"{label} linear solve returned non-finite result.")
+            return sol
+
     def __init__(self, xml_path: Path):
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.data = mujoco.MjData(self.model)
@@ -197,8 +227,10 @@ class ControllerEvaluator:
 
     def _build_kalman_gain(self, config: EpisodeConfig, wheel_lsb_rad_s: float):
         R_meas = self._build_measurement_noise_cov(config, wheel_lsb_rad_s)
-        Pk = solve_discrete_are(self.A.T, self.C_MEAS.T, self.QN, R_meas)
-        return Pk @ self.C_MEAS.T @ np.linalg.inv(self.C_MEAS @ Pk @ self.C_MEAS.T + R_meas)
+        Pk = self._solve_discrete_are_robust(self.A.T, self.C_MEAS.T, self.QN, R_meas, label="Kalman")
+        gram = self.C_MEAS @ Pk @ self.C_MEAS.T + R_meas
+        rhs = self.C_MEAS @ Pk.T
+        return self._solve_linear_robust(gram, rhs, label="Kalman gain").T
 
     def _build_lqr_gain(self, params: CandidateParams):
         A_aug = np.block([[self.A, self.B], [np.zeros((3, 9)), np.eye(3)]])
@@ -223,8 +255,10 @@ class ControllerEvaluator:
             ]
         )
         r_du = np.diag([params.r_du_rw, params.r_du_bx, params.r_du_by])
-        p_aug = solve_discrete_are(A_aug, B_aug, q_aug, r_du)
-        return np.linalg.inv(B_aug.T @ p_aug @ B_aug + r_du) @ (B_aug.T @ p_aug @ A_aug)
+        p_aug = self._solve_discrete_are_robust(A_aug, B_aug, q_aug, r_du, label="Controller")
+        gram = B_aug.T @ p_aug @ B_aug + r_du
+        rhs = B_aug.T @ p_aug @ A_aug
+        return self._solve_linear_robust(gram, rhs, label="Controller gain")
 
     def _validate_xml_ctrlrange(self):
         act_ids = np.array([self.aid_rw, self.aid_base_x, self.aid_base_y], dtype=int)
@@ -829,7 +863,7 @@ def safe_evaluate_candidate(
 ) -> Dict[str, float]:
     try:
         return evaluator.evaluate_candidate(params, episode_seeds, config)
-    except LinAlgError:
+    except (LinAlgError, RuntimeError, ValueError, FloatingPointError):
         return {
             "survival_rate": 0.0,
             "crash_rate": 1.0,

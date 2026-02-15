@@ -5,6 +5,13 @@ MuJoCo experiments for balancing and reaction-wheel control, including:
 - benchmarking scripts
 - firmware-oriented parameter export under `final/firmware/`
 
+## Start Here
+
+The main showcase is the final controller stack in `final/`.
+
+If you want a plain-English walkthrough of what this robot is, why it balances, how the control law works, and how to run it on your own PC:
+- read `final/README.md`
+
 ## Quick Start
 
 1. Create and activate a virtual environment.

@@ -11,10 +11,30 @@ from scipy.linalg import solve_discrete_are
 """
 Teaching-oriented MuJoCo balancing controller.
 
-Design goal:
-- Keep the control logic explicit.
-- Keep parameters centralized in RuntimeConfig.
-- Keep the simulation loop readable so learners can modify behavior safely.
+Reader Guide
+------------
+Big picture:
+- `final.xml` defines rigid bodies, joints, actuator names/ranges, and scene geometry.
+- `final.py` reads that model, linearizes it around upright equilibrium, then runs:
+  1) state estimation (Kalman update from noisy sensors),
+  2) control (delta-u LQR + safety shaping),
+  3) actuator limits and MuJoCo stepping in a viewer loop.
+
+How XML affects Python:
+- Joint/actuator/body names in XML are hard-linked in `lookup_model_ids`.
+- XML actuator `ctrlrange` is checked against runtime command limits to prevent mismatch.
+- Dynamics and geometry in XML determine the A/B matrices obtained by finite-difference
+  linearization (`mjd_transitionFD`), so geometry/inertia edits directly change control behavior.
+
+How Python affects XML:
+- Python does not rewrite XML at runtime; it only loads and validates it.
+- CLI/runtime config can alter simulation behavior (noise, delay, limits), but not mesh/layout.
+
+Run on your laptop/PC:
+- Install deps: `pip install -r requirements.txt`
+- Start viewer: `python final/final.py --mode smooth`
+- Try robust profile: `python final/final.py --mode robust --stability-profile low-spin-robust`
+- Hardware-like simulation: `python final/final.py --real-hardware`
 """
 
 
@@ -42,6 +62,9 @@ class RuntimeConfig:
     imu_angle_noise_std_rad: float
     imu_rate_noise_std_rad_s: float
     wheel_encoder_rate_noise_std_rad_s: float
+    base_encoder_pos_noise_std_m: float
+    base_encoder_vel_noise_std_m_s: float
+    base_state_from_sensors: bool
     max_u: np.ndarray
     max_du: np.ndarray
     disturbance_magnitude: float
@@ -132,6 +155,8 @@ class ModelIds:
     aid_rw: int
     aid_base_x: int
     aid_base_y: int
+    base_x_body_id: int
+    base_y_body_id: int
     stick_body_id: int
 
 
@@ -161,6 +186,8 @@ def lookup_model_ids(model: mujoco.MjModel) -> ModelIds:
         aid_rw=aid("wheel_spin"),
         aid_base_x=aid("base_x_force"),
         aid_base_y=aid("base_y_force"),
+        base_x_body_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_x"),
+        base_y_body_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_y"),
         stick_body_id=mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "stick"),
     )
 
@@ -353,6 +380,12 @@ def parse_args():
         help="Enable base x/y integral action. Disabled by default to avoid drift with unobserved base states.",
     )
     parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument(
+        "--initial-y-tilt-deg",
+        type=float,
+        default=0.0,
+        help="Initial stick tilt in degrees in Y direction (implemented as roll for base_y response).",
+    )
     parser.add_argument("--crash-angle-deg", type=float, default=25.0)
     parser.add_argument("--disturbance-mag", type=float, default=None)
     parser.add_argument("--disturbance-interval", type=int, default=None)
@@ -362,6 +395,40 @@ def parse_args():
     parser.add_argument("--imu-angle-noise-deg", type=float, default=0.25)
     parser.add_argument("--imu-rate-noise", type=float, default=0.02)
     parser.add_argument("--wheel-rate-noise", type=float, default=0.01)
+    parser.add_argument(
+        "--base-pos-noise",
+        type=float,
+        default=0.0015,
+        help="Base position sensor noise std-dev (m).",
+    )
+    parser.add_argument(
+        "--base-vel-noise",
+        type=float,
+        default=0.03,
+        help="Base velocity estimate noise std-dev (m/s).",
+    )
+    parser.add_argument(
+        "--planar-perturb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep mouse perturbation forces in the X/Y plane by zeroing Z-force (enabled by default).",
+    )
+    parser.add_argument(
+        "--drag-assist",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Temporarily reduce controller effort while mouse perturbation is active (enabled by default).",
+    )
+    parser.add_argument(
+        "--push-body",
+        choices=["stick", "base_y", "base_x"],
+        default="stick",
+        help="Body used for scripted push force.",
+    )
+    parser.add_argument("--push-x", type=float, default=0.0, help="Scripted push force in X (N).")
+    parser.add_argument("--push-y", type=float, default=0.0, help="Scripted push force in Y (N).")
+    parser.add_argument("--push-start-s", type=float, default=1.0, help="Scripted push start time (s).")
+    parser.add_argument("--push-duration-s", type=float, default=0.0, help="Scripted push duration (s).")
     parser.add_argument("--legacy-model", action="store_true", help="Disable hardware-realistic timing/noise model.")
     parser.add_argument(
         "--max-wheel-speed",
@@ -706,6 +773,9 @@ def build_config(args) -> RuntimeConfig:
         imu_angle_noise_std_rad=float(np.radians(args.imu_angle_noise_deg)),
         imu_rate_noise_std_rad_s=float(args.imu_rate_noise),
         wheel_encoder_rate_noise_std_rad_s=float(args.wheel_rate_noise),
+        base_encoder_pos_noise_std_m=float(max(args.base_pos_noise, 0.0)),
+        base_encoder_vel_noise_std_m_s=float(max(args.base_vel_noise, 0.0)),
+        base_state_from_sensors=bool((not args.legacy_model) or real_hardware_profile),
         max_u=max_u,
         max_du=max_du,
         disturbance_magnitude=disturbance_magnitude,
@@ -792,17 +862,44 @@ def reset_state(model, data, q_pitch, q_roll, pitch_eq=0.0, roll_eq=0.0):
     mujoco.mj_forward(model, data)
 
 
-def build_partial_measurement_matrix():
-    return np.array(
-        [
-            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-        ],
-        dtype=float,
-    )
+def build_partial_measurement_matrix(cfg: RuntimeConfig):
+    rows = [
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+    ]
+    if cfg.base_state_from_sensors:
+        rows.extend(
+            [
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ]
+        )
+    return np.array(rows, dtype=float)
+
+
+def build_measurement_noise_cov(cfg: RuntimeConfig, wheel_lsb: float) -> np.ndarray:
+    variances = [
+        cfg.imu_angle_noise_std_rad**2,
+        cfg.imu_angle_noise_std_rad**2,
+        cfg.imu_rate_noise_std_rad_s**2,
+        cfg.imu_rate_noise_std_rad_s**2,
+        (wheel_lsb**2) / 12.0 + cfg.wheel_encoder_rate_noise_std_rad_s**2,
+    ]
+    if cfg.base_state_from_sensors:
+        variances.extend(
+            [
+                cfg.base_encoder_pos_noise_std_m**2,
+                cfg.base_encoder_pos_noise_std_m**2,
+                cfg.base_encoder_vel_noise_std_m_s**2,
+                cfg.base_encoder_vel_noise_std_m_s**2,
+            ]
+        )
+    return np.diag(variances)
 
 
 def build_kalman_gain(A: np.ndarray, Qn: np.ndarray, C: np.ndarray, R: np.ndarray):
@@ -831,14 +928,29 @@ def estimator_measurement_update(
         ],
         dtype=float,
     )
+    if cfg.base_state_from_sensors:
+        y = np.concatenate(
+            [
+                y,
+                np.array(
+                    [
+                        x_true[5] + rng.normal(0.0, cfg.base_encoder_pos_noise_std_m),
+                        x_true[6] + rng.normal(0.0, cfg.base_encoder_pos_noise_std_m),
+                        x_true[7] + rng.normal(0.0, cfg.base_encoder_vel_noise_std_m_s),
+                        x_true[8] + rng.normal(0.0, cfg.base_encoder_vel_noise_std_m_s),
+                    ],
+                    dtype=float,
+                ),
+            ]
+        )
     x_est = x_pred + L @ (y - C @ x_pred)
 
-    # Base translation states are not measured by C above, so we anchor them to
-    # simulator truth to avoid estimator drift in this teaching setup.
-    x_est[5] = x_true[5]
-    x_est[6] = x_true[6]
-    x_est[7] = x_true[7]
-    x_est[8] = x_true[8]
+    if not cfg.base_state_from_sensors:
+        # Legacy teaching model: keep unobserved base states tied to truth.
+        x_est[5] = x_true[5]
+        x_est[6] = x_true[6]
+        x_est[7] = x_true[7]
+        x_est[8] = x_true[8]
     return x_est
 
 
@@ -1134,9 +1246,14 @@ def apply_control_delay(cfg: RuntimeConfig, cmd_queue: deque, u_cmd: np.ndarray)
 
 
 def main():
+    # 1) Parse CLI and build runtime tuning/safety profile.
     args = parse_args()
     cfg = build_config(args)
+    initial_roll_rad = float(np.radians(args.initial_y_tilt_deg))
+    push_force_world = np.array([float(args.push_x), float(args.push_y), 0.0], dtype=float)
+    push_end_s = float(args.push_start_s + max(0.0, args.push_duration_s))
 
+    # 2) Load MuJoCo model from XML (source of truth for geometry/joints/actuators).
     xml_path = Path(__file__).with_name("final.xml")
     model = mujoco.MjModel.from_xml_path(str(xml_path))
     data = mujoco.MjData(model)
@@ -1145,8 +1262,14 @@ def main():
         model.opt.gravity[2] = -6.5
 
     ids = lookup_model_ids(model)
-    reset_state(model, data, ids.q_pitch, ids.q_roll)
+    push_body_id = {
+        "stick": ids.stick_body_id,
+        "base_y": ids.base_y_body_id,
+        "base_x": ids.base_x_body_id,
+    }[args.push_body]
+    reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
 
+    # 3) Linearize XML-defined dynamics about upright and build controller gains.
     nx = model.nq + model.nv
     nu = model.nu
     A_full = np.zeros((nx, nx))
@@ -1183,21 +1306,13 @@ def main():
         P_w = solve_discrete_are(A_w, B_w, Q_w, R_w)
         K_wheel_only = np.linalg.inv(B_w.T @ P_w @ B_w + R_w) @ (B_w.T @ P_w @ A_w)
 
+    # 4) Build estimator model from configured sensor channels/noise.
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
     control_dt = control_steps * model.opt.timestep
     wheel_lsb = (2.0 * np.pi) / (cfg.wheel_encoder_ticks_per_rev * control_dt)
-    C = build_partial_measurement_matrix()
+    C = build_partial_measurement_matrix(cfg)
     Qn = np.diag([1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5])
-    wheel_var = (wheel_lsb**2) / 12.0 + cfg.wheel_encoder_rate_noise_std_rad_s**2
-    Rn = np.diag(
-        [
-            cfg.imu_angle_noise_std_rad**2,
-            cfg.imu_angle_noise_std_rad**2,
-            cfg.imu_rate_noise_std_rad_s**2,
-            cfg.imu_rate_noise_std_rad_s**2,
-            wheel_var,
-        ]
-    )
+    Rn = build_measurement_noise_cov(cfg, wheel_lsb)
     L = build_kalman_gain(A, Qn, C, Rn)
 
     ACT_IDS = np.array([ids.aid_rw, ids.aid_base_x, ids.aid_base_y], dtype=int)
@@ -1317,13 +1432,19 @@ def main():
     print(f"Wheel-rate lsb @ control_dt={control_dt:.6f}s: {wheel_lsb:.6e} rad/s")
     print(f"XML ctrlrange low: {XML_CTRL_LOW}")
     print(f"XML ctrlrange high: {XML_CTRL_HIGH}")
+    print(f"Initial Y-direction tilt (roll): {args.initial_y_tilt_deg:.2f} deg")
+    print(
+        "Scripted push: "
+        f"body={args.push_body} F=({args.push_x:.2f}, {args.push_y:.2f})N "
+        f"start={args.push_start_s:.2f}s duration={args.push_duration_s:.2f}s"
+    )
     if cfg.hardware_safe:
         print("HARDWARE-SAFE profile active: conservative torque/slew/speed limits enabled.")
     if cfg.real_hardware_profile:
         base_msg = "enabled" if cfg.allow_base_motion else "disabled (unlock required)"
         print(f"REAL-HARDWARE profile active: strict bring-up limits + forced stop_on_crash + base motion {base_msg}.")
 
-    reset_state(model, data, ids.q_pitch, ids.q_roll)
+    reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
     upright_blend = 0.0
     despin_gain = 0.25
     rng = np.random.default_rng(cfg.seed)
@@ -1359,10 +1480,17 @@ def main():
     wheel_over_budget_count = 0
     wheel_over_hard_count = 0
     high_spin_steps = 0
+    prev_script_force = np.zeros(3, dtype=float)
 
+    # 5) Closed-loop runtime: estimate -> control -> clamp -> simulate -> render.
     with mujoco.viewer.launch_passive(model, data) as viewer:
         while viewer.is_running():
             step_count += 1
+            # Pull GUI events/perturbations before control+step so dragging is applied immediately.
+            viewer.sync()
+            if np.any(prev_script_force):
+                data.xfrc_applied[push_body_id, :3] -= prev_script_force
+                prev_script_force[:] = 0.0
             if cfg.wheel_only:
                 enforce_wheel_only_constraints(model, data, ids)
 
@@ -1370,7 +1498,7 @@ def main():
 
             if not np.all(np.isfinite(x_true)):
                 print(f"\nNumerical instability at step {step_count}; resetting state.")
-                reset_state(model, data, ids.q_pitch, ids.q_roll)
+                reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
                 (
                     x_est,
                     u_applied,
@@ -1458,10 +1586,16 @@ def main():
             if high_spin_active:
                 high_spin_steps += 1
 
+            drag_control_scale = 1.0
+            if args.drag_assist:
+                if np.any(np.abs(data.xfrc_applied[:, :3]) > 1e-9) or np.any(np.abs(data.xfrc_applied[:, 3:]) > 1e-9):
+                    drag_control_scale = 0.2
+            u_drag = u_applied * drag_control_scale
+
             data.ctrl[:] = 0.0
             wheel_speed = float(data.qvel[ids.v_rw])
-            wheel_cmd = wheel_command_with_limits(cfg, wheel_speed, float(u_applied[0]))
-            derate_hits[0] += int(abs(wheel_cmd - u_applied[0]) > 1e-9)
+            wheel_cmd = wheel_command_with_limits(cfg, wheel_speed, float(u_drag[0]))
+            derate_hits[0] += int(abs(wheel_cmd - u_drag[0]) > 1e-9)
             data.ctrl[ids.aid_rw] = wheel_cmd
 
             if cfg.allow_base_motion:
@@ -1471,19 +1605,22 @@ def main():
                     base_y_speed=float(data.qvel[ids.v_base_y]),
                     base_x=float(data.qpos[ids.q_base_x]),
                     base_y=float(data.qpos[ids.q_base_y]),
-                    base_x_request=float(u_applied[1]),
-                    base_y_request=float(u_applied[2]),
+                    base_x_request=float(u_drag[1]),
+                    base_y_request=float(u_drag[2]),
                 )
             else:
                 base_x_cmd = 0.0
                 base_y_cmd = 0.0
-            derate_hits[1] += int(abs(base_x_cmd - u_applied[1]) > 1e-9)
-            derate_hits[2] += int(abs(base_y_cmd - u_applied[2]) > 1e-9)
+            derate_hits[1] += int(abs(base_x_cmd - u_drag[1]) > 1e-9)
+            derate_hits[2] += int(abs(base_y_cmd - u_drag[2]) > 1e-9)
             data.ctrl[ids.aid_base_x] = base_x_cmd
             data.ctrl[ids.aid_base_y] = base_y_cmd
             u_eff_applied[:] = [wheel_cmd, base_x_cmd, base_y_cmd]
-
-            data.xfrc_applied[ids.stick_body_id, :3] = 0.0
+            if args.planar_perturb:
+                data.xfrc_applied[:, 2] = 0.0
+            if args.push_duration_s > 0.0 and args.push_start_s <= data.time < push_end_s:
+                data.xfrc_applied[push_body_id, :3] += push_force_world
+                prev_script_force[:] = push_force_world
 
             mujoco.mj_step(model, data)
             if cfg.wheel_only:
@@ -1493,6 +1630,7 @@ def main():
             speed_limit_hits[2] += int(abs(data.qvel[ids.v_roll]) > cfg.max_pitch_roll_rate_rad_s)
             speed_limit_hits[3] += int(abs(data.qvel[ids.v_base_x]) > cfg.max_base_speed_m_s)
             speed_limit_hits[4] += int(abs(data.qvel[ids.v_base_y]) > cfg.max_base_speed_m_s)
+            # Push latest state to viewer.
             viewer.sync()
 
             pitch = float(data.qpos[ids.q_pitch])
@@ -1517,7 +1655,7 @@ def main():
                 )
                 if cfg.stop_on_crash:
                     break
-                reset_state(model, data, ids.q_pitch, ids.q_roll)
+                reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
                 (
                     x_est,
                     u_applied,
