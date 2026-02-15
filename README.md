@@ -174,6 +174,22 @@ python final/export_firmware_params.py --mode smooth
   - `--log-control-terms`
   - `--control-terms-csv <path>`
 
+## Recent Update (February 2026)
+
+- Added controller family selection in runtime:
+  - `--controller-family {current,hybrid_modern,paper_split_baseline}`
+- Added interpretable control-term decomposition and optional CSV logging:
+  - `term_lqr_core`, `term_roll_stability`, `term_pitch_stability`, `term_despin`, `term_base_hold`, `term_safety_shaping`
+  - `--log-control-terms`, `--control-terms-csv`
+- Added literature-style comparator path (`paper_split_baseline`) for fair benchmark comparison.
+- Extended evaluator/benchmark pipeline with controller-family support, composite score reporting, and promotion decision fields.
+- Added significance-aware promotion logic (paired bootstrap) for `hybrid_modern` vs `current`.
+- Added CI-friendly benchmark profiles and script entry points:
+  - `python final/benchmark.py --benchmark-profile fast_pr`
+  - `python final/benchmark.py --benchmark-profile nightly_long`
+  - `python final/benchmark_fast_pr.py`
+  - `python final/benchmark_nightly_long.py`
+
 ## Benchmark Protocol
 
 - Main benchmark script: `final/benchmark.py`

@@ -157,7 +157,20 @@ python final/final.py --mode robust --real-hardware
 - It includes a literature-style comparator (`paper_split_baseline`) for fair evaluation.
 - It supports interpretable term logging (`--log-control-terms`) so each command can be traced to named terms.
 
-## 9) Benchmark Protocol
+## 9) Recent Update (February 2026)
+
+- Added runtime controller family selector:
+  - `--controller-family {current,hybrid_modern,paper_split_baseline}`
+- Added explainability logging for control terms with optional CSV output:
+  - `--log-control-terms`
+  - `--control-terms-csv <path>`
+- Added benchmark coverage for modern, literature-style, and legacy controller families.
+- Added composite-score + hard-gate + significance-based promotion logic.
+- Added benchmark profiles for operations:
+  - `fast_pr` for quick deterministic checks
+  - `nightly_long` for full stress validation
+
+## 10) Benchmark Protocol
 
 - Run with `final/benchmark.py`.
 - Default benchmark compares multiple controller families and operating modes.
@@ -178,7 +191,7 @@ Nightly long profile:
 python final/benchmark.py --benchmark-profile nightly_long
 ```
 
-## 10) Known Limits
+## 11) Known Limits
 
 - This is still a simulation, not a certified hardware safety system.
 - Contact/friction/sensor models are approximations.
