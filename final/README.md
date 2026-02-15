@@ -6,6 +6,52 @@ This folder is the "main demo" of the project.
 
 It simulates a self-balancing robot in MuJoCo and shows how software can keep a robot upright using a reaction wheel and a moving base.
 
+## Scope and Claim Boundaries
+
+- This folder reports simulation results only, under the exact benchmark settings and artifacts in `final/results/`.
+- It does not claim certified hardware safety, formal stability guarantees, or universal superiority over prior physical robots.
+- Literature comparisons are for context and reproducibility, not direct apples-to-apples hardware claims.
+
+## Implemented Architecture (Current)
+
+- State estimation: linear Kalman correction from noisy IMU/encoder-like channels.
+- Control core: delta-u LQR with runtime safety shaping and mode-specific terms.
+- Safety policies: wheel-speed budget/high-spin latch, base-authority gating, actuator clipping/rate limits, crash-angle stop logic.
+
+## Not Implemented (Do Not Infer)
+
+- Disturbance-observer-based control law (DOB) with explicit online disturbance compensation.
+- Control-Lyapunov-function QP controller (CLF-QP), including closed-form CLF-QP update rules.
+- Formal Lyapunov proof for the full runtime controller.
+
+## Metrics Snapshot (2026-02-16)
+
+Canonical source:
+- `final/results/benchmark_20260216_011044_summary.txt`
+- `final/results/benchmark_20260216_011044.csv`
+- `final/results/benchmark_20260216_011044_protocol.json`
+
+| Controller (mode_default / nominal / default) | Survival | Crash rate | Composite score |
+|---|---:|---:|---:|
+| `baseline_robust_hinf_like` | 1.000 | 0.000 | 75.457 |
+| `hybrid_modern` | 1.000 | 0.000 | 74.460 |
+| `current` | 1.000 | 0.000 | 73.993 |
+| `paper_split_baseline` | 1.000 | 0.000 | 72.913 |
+| `baseline_mpc` | 0.625 | 0.375 | 37.837 |
+
+## Reproducibility
+
+Benchmark command used for this snapshot:
+
+```bash
+python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
+```
+
+Expected outputs:
+- `final/results/benchmark_<timestamp>_summary.txt`
+- `final/results/benchmark_<timestamp>.csv`
+- `final/results/benchmark_<timestamp>_protocol.json`
+
 ## 1) What This Is
 
 In simple terms, this robot is like a broom trying to stand upright on your hand:
@@ -84,7 +130,7 @@ Safety layers include:
 - actuator slew/torque limits,
 - crash-angle stop logic.
 
-## 5) Why This Is Close to Real Life
+## 5) Realism Assumptions in Simulation
 
 The simulation intentionally includes real-world effects:
 - control loop rate separate from physics timestep,
@@ -153,7 +199,7 @@ Try hardware-like constraints:
 python final/final.py --mode robust --real-hardware
 ```
 
-## 8) Why This Is Modern
+## 8) Implemented Runtime Features
 
 - It uses a hybrid architecture: model-based core with explicit safety shaping.
 - It includes a literature-style comparator (`paper_split_baseline`) for fair evaluation.

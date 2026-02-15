@@ -28,6 +28,52 @@ This is a digital twin of a balancing robot with:
 
 You can run it, push it, switch modes, and inspect how close the behavior is to real life constraints.
 
+## Scope and Claim Boundaries
+
+- This repository claims simulation results only, under the exact benchmark settings and artifacts in `final/results/`.
+- It does not claim certified hardware safety, formal stability guarantees, or universal superiority over prior physical robots.
+- Comparisons to literature are for context and reproducibility, not direct apples-to-apples hardware claims.
+
+## Implemented Architecture (Current)
+
+- State estimation: linear Kalman correction from noisy sensor-like channels.
+- Control core: delta-u LQR with mode-dependent shaping terms.
+- Runtime safety shaping: torque/rate limits, wheel-speed budget/high-spin latch, base-authority gating, crash-angle logic.
+
+## Not Implemented (Do Not Infer)
+
+- Disturbance-observer-based control law (DOB) with explicit disturbance-state compensation.
+- Control-Lyapunov-function QP controller (CLF-QP), including closed-form CLF-QP updates.
+- Formal Lyapunov proof of stability for the full runtime controller.
+
+## Metrics Snapshot (2026-02-16)
+
+Canonical source:
+- `final/results/benchmark_20260216_011044_summary.txt`
+- `final/results/benchmark_20260216_011044.csv`
+- `final/results/benchmark_20260216_011044_protocol.json`
+
+| Controller (mode_default / nominal / default) | Survival | Crash rate | Composite score |
+|---|---:|---:|---:|
+| `baseline_robust_hinf_like` | 1.000 | 0.000 | 75.457 |
+| `hybrid_modern` | 1.000 | 0.000 | 74.460 |
+| `current` | 1.000 | 0.000 | 73.993 |
+| `paper_split_baseline` | 1.000 | 0.000 | 72.913 |
+| `baseline_mpc` | 0.625 | 0.375 | 37.837 |
+
+## Reproducibility
+
+Benchmark command used for the snapshot:
+
+```bash
+python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
+```
+
+Expected outputs:
+- `final/results/benchmark_<timestamp>_summary.txt`
+- `final/results/benchmark_<timestamp>.csv`
+- `final/results/benchmark_<timestamp>_protocol.json`
+
 ## Mechanical Design (Why the Geometry Can Balance)
 
 ### Main parts
@@ -97,7 +143,7 @@ Safety logic includes:
 - actuator saturation/rate limiting,
 - crash-angle handling.
 
-## Why It Is Close to Real Life
+## Realism Assumptions in Simulation
 
 The simulator includes practical constraints, not just ideal physics:
 - control loop frequency (`control_hz`) separate from physics timestep,
@@ -173,11 +219,11 @@ python final/test_export_parity.py
 python final/export_firmware_params.py --mode smooth
 ```
 
-## Modernization Notes
+## Runtime Controller Modes
 
 - The runtime now supports controller families:
   - `current` (backward-compatible baseline),
-  - `hybrid_modern` (preferred modernized controller),
+  - `hybrid_modern` (alternative tuned controller),
   - `paper_split_baseline` (literature-style comparator).
 - `hybrid_modern` is not a paper copy. It keeps the model-based core and adds explicit interpretable terms.
 - Optional explainability logging:
