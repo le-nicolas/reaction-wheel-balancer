@@ -1,6 +1,7 @@
 # Web Side Quest: Self Balancing Bot
 
-This side quest runs a balancing bot in **MuJoCo WebAssembly** with **Three.js** rendering.
+This side quest runs the **full Python controller stack from `final/final.py`** (headless)
+and streams live state to a Three.js renderer in the browser.
 You change payload mass, reset, and observe whether it stabilizes or fails from overload.
 
 ## Target Browser
@@ -12,16 +13,16 @@ You change payload mass, reset, and observe whether it stabilizes or fails from 
 From repo root:
 
 ```bash
-python -m http.server 8080
+python web/server.py --port 8090
 ```
 
 Then open:
 
-`http://localhost:8080/web/`
+`http://localhost:8090/web/`
 
 ## Behavior
 
-- `Payload Mass` slider sets a physical payload body on top of the stick.
+- `Payload Mass` slider sets a physical payload body on top of the stick (Python MuJoCo runtime).
 - Failure triggers when either:
   - tilt angle exceeds threshold, or
   - COM stays outside support radius for consecutive steps.
