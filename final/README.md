@@ -17,7 +17,7 @@ It simulates a self-balancing robot in MuJoCo and shows how software can keep a 
 - State estimation: linear Kalman correction from noisy IMU/encoder-like channels.
 - Control core: delta-u LQR with runtime safety shaping and mode-specific terms.
 - Optional residual correction: offline-trained PyTorch model adds bounded `delta_u` on top of nominal control (`u = u_nominal + delta_u`), with runtime tilt/rate gating.
-- Safety policies: wheel-speed budget/high-spin latch, base-authority gating, actuator clipping/rate limits, crash-angle stop logic.
+- Safety policies: wheel-speed budget/high-spin latch, strict hard-speed same-direction suppression, base-authority gating, actuator clipping/rate limits, crash-angle stop logic.
 
 ## Not Implemented (Do Not Infer)
 
@@ -134,6 +134,7 @@ Residual correction behavior (optional):
 
 Safety layers include:
 - wheel speed budget and high-spin recovery latch,
+- strict hard-zone protection that suppresses same-direction wheel torque near hard speed,
 - base authority gating,
 - actuator slew/torque limits,
 - crash-angle stop logic.
@@ -224,6 +225,7 @@ python final/final.py --mode smooth --residual-model path/to/residual.pt --resid
 - It uses a hybrid architecture: model-based core with explicit safety shaping.
 - It includes a literature-style comparator (`paper_split_baseline`) for fair evaluation.
 - It supports interpretable term logging (`--log-control-terms`) so each command can be traced to named terms.
+- It now logs wheel-spin telemetry for tuning: signed peak speed, mean absolute speed, over-budget/over-hard ratios (total and sign-split), and hard-zone suppression counters.
 
 ## 9) Recent Update (February 2026)
 

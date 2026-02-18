@@ -87,7 +87,7 @@ Runtime stack:
 - state estimation: linear Kalman correction from noisy channels
 - control core: delta-u LQR with controller-family-specific shaping
 - optional residual correction: offline PyTorch model adds bounded `delta_u` to nominal command
-- safety shaping: saturation and rate limits, wheel-speed budget, high-spin logic, base-authority gating, crash-angle handling
+- safety shaping: saturation and rate limits, wheel-speed budget/high-spin logic, strict hard-speed same-direction suppression, base-authority gating, crash-angle handling
 
 ### 2.2 Controller families in benchmark
 
@@ -159,6 +159,10 @@ Optional residual correction run:
 ```bash
 python final/final.py --mode smooth --residual-model path/to/residual.pt --residual-scale 0.20
 ```
+
+Wheel-spin diagnostics:
+- runtime summary now reports signed wheel speed peaks, mean absolute wheel speed, over-budget/over-hard ratios (total and sign-split), and hard-zone suppression counters for tuning.
+- `--log-control-terms` and `--trace-events-csv` include wheel-rate/budget/hard telemetry fields.
 
 ### 2.6 Firmware relevance
 

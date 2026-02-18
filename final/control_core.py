@@ -61,8 +61,8 @@ def wheel_command_with_limits(cfg: RuntimeConfig, wheel_speed: float, wheel_cmd_
     wheel_cmd = float(np.clip(wheel_cmd_requested, -wheel_limit, wheel_limit))
     hard_speed = min(cfg.wheel_spin_hard_frac * cfg.max_wheel_speed_rad_s, cfg.wheel_spin_hard_abs_rad_s)
     if wheel_speed_abs >= hard_speed and np.sign(wheel_cmd) == np.sign(wheel_speed):
-        # Emergency same-direction suppression before absolute speed limit.
-        wheel_cmd *= 0.03
+        # Near hard-speed, never allow same-direction torque that can increase wheel runaway.
+        wheel_cmd = 0.0
     if wheel_speed_abs >= hard_speed and abs(wheel_speed) > 1e-9:
         # Actuator-level desaturation floor: enforce some opposite torque near hard speed.
         over_hard = float(np.clip((wheel_speed_abs - hard_speed) / max(hard_speed, 1e-6), 0.0, 1.0))

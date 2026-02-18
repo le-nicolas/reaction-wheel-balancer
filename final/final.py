@@ -124,6 +124,10 @@ def main():
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
     control_dt = control_steps * model.opt.timestep
     wheel_lsb = (2.0 * np.pi) / (cfg.wheel_encoder_ticks_per_rev * control_dt)
+    wheel_budget_speed = min(cfg.wheel_spin_budget_frac * cfg.max_wheel_speed_rad_s, cfg.wheel_spin_budget_abs_rad_s)
+    wheel_hard_speed = min(cfg.wheel_spin_hard_frac * cfg.max_wheel_speed_rad_s, cfg.wheel_spin_hard_abs_rad_s)
+    if not cfg.allow_base_motion:
+        wheel_hard_speed *= 1.10
     C = build_partial_measurement_matrix(cfg)
     Qn = np.diag([1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5])
     Rn = build_measurement_noise_cov(cfg, wheel_lsb)
@@ -200,6 +204,7 @@ def main():
         f"hard_abs={cfg.wheel_spin_hard_abs_rad_s:.1f}rad/s "
         f"base_bias={cfg.wheel_to_base_bias_gain:.2f}"
     )
+    print(f"Wheel spin thresholds (runtime): budget={wheel_budget_speed:.2f}rad/s hard={wheel_hard_speed:.2f}rad/s")
     print(
         "High-spin latch: "
         f"exit={cfg.high_spin_exit_frac * 100.0:.1f}% of hard "
@@ -305,6 +310,17 @@ def main():
     wheel_over_budget_count = 0
     wheel_over_hard_count = 0
     high_spin_steps = 0
+    wheel_speed_abs_sum = 0.0
+    wheel_speed_abs_max = 0.0
+    wheel_speed_pos_peak = 0.0
+    wheel_speed_neg_peak = 0.0
+    wheel_speed_samples = 0
+    wheel_over_budget_pos_steps = 0
+    wheel_over_budget_neg_steps = 0
+    wheel_over_hard_pos_steps = 0
+    wheel_over_hard_neg_steps = 0
+    wheel_hard_same_dir_request_count = 0
+    wheel_hard_safe_output_count = 0
     residual_applied_count = 0
     residual_clipped_count = 0
     residual_gate_blocked_count = 0
@@ -350,6 +366,13 @@ def main():
                 "term_residual_rw",
                 "term_residual_bx",
                 "term_residual_by",
+                "wheel_rate",
+                "wheel_rate_abs",
+                "wheel_budget_speed",
+                "wheel_hard_speed",
+                "wheel_over_budget",
+                "wheel_over_hard",
+                "high_spin_active",
                 "u_cmd_rw",
                 "u_cmd_bx",
                 "u_cmd_by",
@@ -373,6 +396,12 @@ def main():
                 "pitch_rate",
                 "roll_rate",
                 "wheel_rate",
+                "wheel_rate_abs",
+                "wheel_budget_speed",
+                "wheel_hard_speed",
+                "wheel_over_budget",
+                "wheel_over_hard",
+                "high_spin_active",
                 "base_x",
                 "base_y",
                 "u_rw",
@@ -523,6 +552,13 @@ def main():
                             "term_residual_rw": float(residual_delta[0]),
                             "term_residual_bx": float(residual_delta[1]),
                             "term_residual_by": float(residual_delta[2]),
+                            "wheel_rate": float(x_true[4]),
+                            "wheel_rate_abs": float(abs(x_true[4])),
+                            "wheel_budget_speed": float(wheel_budget_speed),
+                            "wheel_hard_speed": float(wheel_hard_speed),
+                            "wheel_over_budget": int(abs(float(x_true[4])) > wheel_budget_speed),
+                            "wheel_over_hard": int(abs(float(x_true[4])) > wheel_hard_speed),
+                            "high_spin_active": int(high_spin_active),
                             "u_cmd_rw": float(u_cmd[0]),
                             "u_cmd_bx": float(u_cmd[1]),
                             "u_cmd_by": float(u_cmd[2]),
@@ -541,6 +577,12 @@ def main():
                             "pitch_rate": float(x_true[2]),
                             "roll_rate": float(x_true[3]),
                             "wheel_rate": float(x_true[4]),
+                            "wheel_rate_abs": float(abs(x_true[4])),
+                            "wheel_budget_speed": float(wheel_budget_speed),
+                            "wheel_hard_speed": float(wheel_hard_speed),
+                            "wheel_over_budget": int(abs(float(x_true[4])) > wheel_budget_speed),
+                            "wheel_over_hard": int(abs(float(x_true[4])) > wheel_hard_speed),
+                            "high_spin_active": int(high_spin_active),
                             "base_x": float(x_true[5]),
                             "base_y": float(x_true[6]),
                             "u_rw": float(u_cmd[0]),
@@ -562,7 +604,14 @@ def main():
 
             data.ctrl[:] = 0.0
             wheel_speed = float(data.qvel[ids.v_rw])
+            if abs(wheel_speed) >= wheel_hard_speed and abs(float(u_drag[0])) > 1e-9 and np.sign(float(u_drag[0])) == np.sign(
+                wheel_speed
+            ):
+                wheel_hard_same_dir_request_count += 1
             wheel_cmd = wheel_command_with_limits(cfg, wheel_speed, float(u_drag[0]))
+            if abs(wheel_speed) >= wheel_hard_speed:
+                if abs(wheel_cmd) <= 1e-9 or (abs(wheel_speed) > 1e-9 and np.sign(wheel_cmd) != np.sign(wheel_speed)):
+                    wheel_hard_safe_output_count += 1
             derate_hits[0] += int(abs(wheel_cmd - u_drag[0]) > 1e-9)
             data.ctrl[ids.aid_rw] = wheel_cmd
 
@@ -593,6 +642,23 @@ def main():
             mujoco.mj_step(model, data)
             if cfg.wheel_only:
                 enforce_wheel_only_constraints(model, data, ids)
+            wheel_speed_after = float(data.qvel[ids.v_rw])
+            wheel_speed_abs_after = abs(wheel_speed_after)
+            wheel_speed_abs_sum += wheel_speed_abs_after
+            wheel_speed_abs_max = max(wheel_speed_abs_max, wheel_speed_abs_after)
+            wheel_speed_pos_peak = max(wheel_speed_pos_peak, wheel_speed_after)
+            wheel_speed_neg_peak = min(wheel_speed_neg_peak, wheel_speed_after)
+            wheel_speed_samples += 1
+            if wheel_speed_abs_after > wheel_budget_speed:
+                if wheel_speed_after >= 0.0:
+                    wheel_over_budget_pos_steps += 1
+                else:
+                    wheel_over_budget_neg_steps += 1
+            if wheel_speed_abs_after > wheel_hard_speed:
+                if wheel_speed_after >= 0.0:
+                    wheel_over_hard_pos_steps += 1
+                else:
+                    wheel_over_hard_neg_steps += 1
             speed_limit_hits[0] += int(abs(data.qvel[ids.v_rw]) > cfg.max_wheel_speed_rad_s)
             speed_limit_hits[1] += int(abs(data.qvel[ids.v_pitch]) > cfg.max_pitch_roll_rate_rad_s)
             speed_limit_hits[2] += int(abs(data.qvel[ids.v_roll]) > cfg.max_pitch_roll_rate_rad_s)
@@ -630,6 +696,12 @@ def main():
                             "pitch_rate": float(data.qvel[ids.v_pitch]),
                             "roll_rate": float(data.qvel[ids.v_roll]),
                             "wheel_rate": float(data.qvel[ids.v_rw]),
+                            "wheel_rate_abs": float(abs(data.qvel[ids.v_rw])),
+                            "wheel_budget_speed": float(wheel_budget_speed),
+                            "wheel_hard_speed": float(wheel_hard_speed),
+                            "wheel_over_budget": int(abs(float(data.qvel[ids.v_rw])) > wheel_budget_speed),
+                            "wheel_over_hard": int(abs(float(data.qvel[ids.v_rw])) > wheel_hard_speed),
+                            "high_spin_active": int(high_spin_active),
                             "base_x": float(data.qpos[ids.q_base_x]),
                             "base_y": float(data.qpos[ids.q_base_y]),
                             "u_rw": float(u_eff_applied[0]),
@@ -682,6 +754,28 @@ def main():
     print(f"Wheel over-budget count: {wheel_over_budget_count}")
     print(f"Wheel over-hard count: {wheel_over_hard_count}")
     print(f"High-spin active ratio: {high_spin_steps / max(step_count, 1):.3f}")
+    wheel_sample_denom = max(wheel_speed_samples, 1)
+    wheel_over_budget_steps_total = wheel_over_budget_pos_steps + wheel_over_budget_neg_steps
+    wheel_over_hard_steps_total = wheel_over_hard_pos_steps + wheel_over_hard_neg_steps
+    print(
+        f"Wheel speed peaks [max_pos,min_neg,max_abs]: "
+        f"{wheel_speed_pos_peak:.2f}, {wheel_speed_neg_peak:.2f}, {wheel_speed_abs_max:.2f} rad/s"
+    )
+    print(f"Wheel mean |speed|: {wheel_speed_abs_sum / wheel_sample_denom:.2f} rad/s")
+    print(
+        "Wheel over-budget ratio [total,pos,neg]: "
+        f"{wheel_over_budget_steps_total / wheel_sample_denom:.3f}, "
+        f"{wheel_over_budget_pos_steps / wheel_sample_denom:.3f}, "
+        f"{wheel_over_budget_neg_steps / wheel_sample_denom:.3f}"
+    )
+    print(
+        "Wheel over-hard ratio [total,pos,neg]: "
+        f"{wheel_over_hard_steps_total / wheel_sample_denom:.3f}, "
+        f"{wheel_over_hard_pos_steps / wheel_sample_denom:.3f}, "
+        f"{wheel_over_hard_neg_steps / wheel_sample_denom:.3f}"
+    )
+    print(f"Wheel hard-zone same-direction request count: {wheel_hard_same_dir_request_count}")
+    print(f"Wheel hard-zone safe-output count: {wheel_hard_safe_output_count}")
     print(f"Residual applied rate [updates]: {residual_applied_count / denom:.3f}")
     print(f"Residual clipped count: {residual_clipped_count}")
     print(f"Residual gate-blocked count: {residual_gate_blocked_count}")
