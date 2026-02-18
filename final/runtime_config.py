@@ -35,6 +35,11 @@ class RuntimeConfig:
     base_encoder_pos_noise_std_m: float
     base_encoder_vel_noise_std_m_s: float
     base_state_from_sensors: bool
+    residual_model_path: str | None
+    residual_scale: float
+    residual_max_abs_u: np.ndarray
+    residual_gate_tilt_rad: float
+    residual_gate_rate_rad_s: float
     max_u: np.ndarray
     max_du: np.ndarray
     disturbance_magnitude: float
@@ -141,6 +146,48 @@ def parse_args(argv=None):
         type=str,
         default=None,
         help="Optional runtime trace/event CSV path for replay alignment.",
+    )
+    parser.add_argument(
+        "--residual-model",
+        type=str,
+        default=None,
+        help="Optional PyTorch residual model checkpoint path (.pt/.pth).",
+    )
+    parser.add_argument(
+        "--residual-scale",
+        type=float,
+        default=0.0,
+        help="Global multiplier for residual command output (0 disables residual path).",
+    )
+    parser.add_argument(
+        "--residual-max-rw",
+        type=float,
+        default=6.0,
+        help="Max residual wheel command magnitude (same units as u_rw).",
+    )
+    parser.add_argument(
+        "--residual-max-bx",
+        type=float,
+        default=1.0,
+        help="Max residual base-x command magnitude.",
+    )
+    parser.add_argument(
+        "--residual-max-by",
+        type=float,
+        default=1.0,
+        help="Max residual base-y command magnitude.",
+    )
+    parser.add_argument(
+        "--residual-gate-tilt-deg",
+        type=float,
+        default=8.0,
+        help="Disable residual output when |pitch|/|roll| exceeds this tilt (deg).",
+    )
+    parser.add_argument(
+        "--residual-gate-rate",
+        type=float,
+        default=3.0,
+        help="Disable residual output when |pitch_rate|/|roll_rate| exceeds this value (rad/s).",
     )
     parser.add_argument(
         "--preset",
@@ -556,6 +603,19 @@ def build_config(args) -> RuntimeConfig:
     if real_hardware_profile:
         control_delay_steps = max(control_delay_steps, 1)
 
+    residual_scale = float(max(getattr(args, "residual_scale", 0.0), 0.0))
+    residual_max_abs_u = np.array(
+        [
+            max(float(getattr(args, "residual_max_rw", 0.0)), 0.0),
+            max(float(getattr(args, "residual_max_bx", 0.0)), 0.0),
+            max(float(getattr(args, "residual_max_by", 0.0)), 0.0),
+        ],
+        dtype=float,
+    )
+    residual_max_abs_u = np.minimum(residual_max_abs_u, max_u)
+    residual_gate_tilt_rad = float(np.radians(max(float(getattr(args, "residual_gate_tilt_deg", 0.0)), 0.0)))
+    residual_gate_rate_rad_s = float(max(float(getattr(args, "residual_gate_rate", 0.0)), 0.0))
+
     return RuntimeConfig(
         controller_family=str(getattr(args, "controller_family", "current")),
         log_control_terms=bool(getattr(args, "log_control_terms", False)),
@@ -586,6 +646,11 @@ def build_config(args) -> RuntimeConfig:
         base_encoder_pos_noise_std_m=float(max(args.base_pos_noise, 0.0)),
         base_encoder_vel_noise_std_m_s=float(max(args.base_vel_noise, 0.0)),
         base_state_from_sensors=bool((not args.legacy_model) or real_hardware_profile),
+        residual_model_path=(str(getattr(args, "residual_model", "")) if getattr(args, "residual_model", None) else None),
+        residual_scale=residual_scale,
+        residual_max_abs_u=residual_max_abs_u,
+        residual_gate_tilt_rad=residual_gate_tilt_rad,
+        residual_gate_rate_rad_s=residual_gate_rate_rad_s,
         max_u=max_u,
         max_du=max_du,
         disturbance_magnitude=disturbance_magnitude,

@@ -86,6 +86,7 @@ python final/plot_paper_vs_sim.py --csv final/results/benchmark_20260216_011044.
 Runtime stack:
 - state estimation: linear Kalman correction from noisy channels
 - control core: delta-u LQR with controller-family-specific shaping
+- optional residual correction: offline PyTorch model adds bounded `delta_u` to nominal command
 - safety shaping: saturation and rate limits, wheel-speed budget, high-spin logic, base-authority gating, crash-angle handling
 
 ### 2.2 Controller families in benchmark
@@ -132,6 +133,11 @@ Install:
 pip install -r requirements.txt
 ```
 
+Optional for residual correction:
+```bash
+pip install torch
+```
+
 Viewer run:
 ```bash
 python final/final.py --mode smooth
@@ -147,6 +153,11 @@ Controller family selection:
 python final/final.py --mode smooth --controller-family current
 python final/final.py --mode smooth --controller-family hybrid_modern
 python final/final.py --mode smooth --controller-family paper_split_baseline
+```
+
+Optional residual correction run:
+```bash
+python final/final.py --mode smooth --residual-model path/to/residual.pt --residual-scale 0.20
 ```
 
 ### 2.6 Firmware relevance

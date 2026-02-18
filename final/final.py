@@ -25,6 +25,7 @@ from control_core import (
     reset_controller_buffers,
     wheel_command_with_limits,
 )
+from residual_model import ResidualPolicy
 
 """
 Teaching-oriented MuJoCo balancing controller.
@@ -60,6 +61,7 @@ def main():
     # 1) Parse CLI and build runtime tuning/safety profile.
     args = parse_args()
     cfg = build_config(args)
+    residual_policy = ResidualPolicy(cfg)
     initial_roll_rad = float(np.radians(args.initial_y_tilt_deg))
     push_force_world = np.array([float(args.push_x), float(args.push_y), 0.0], dtype=float)
     push_end_s = float(args.push_start_s + max(0.0, args.push_duration_s))
@@ -245,6 +247,16 @@ def main():
     print(f"Wheel-rate lsb @ control_dt={control_dt:.6f}s: {wheel_lsb:.6e} rad/s")
     print(f"XML ctrlrange low: {XML_CTRL_LOW}")
     print(f"XML ctrlrange high: {XML_CTRL_HIGH}")
+    print("\n=== RESIDUAL POLICY ===")
+    print(f"residual_model={cfg.residual_model_path}")
+    print(f"residual_scale={cfg.residual_scale:.3f}")
+    print(f"residual_max_abs_u={cfg.residual_max_abs_u}")
+    print(
+        "residual_gate: "
+        f"tilt={np.degrees(cfg.residual_gate_tilt_rad):.2f}deg "
+        f"rate={cfg.residual_gate_rate_rad_s:.2f}rad/s"
+    )
+    print(f"residual_status={residual_policy.status}")
     print(f"Initial Y-direction tilt (roll): {args.initial_y_tilt_deg:.2f} deg")
     print(
         "Scripted push: "
@@ -293,6 +305,10 @@ def main():
     wheel_over_budget_count = 0
     wheel_over_hard_count = 0
     high_spin_steps = 0
+    residual_applied_count = 0
+    residual_clipped_count = 0
+    residual_gate_blocked_count = 0
+    residual_max_abs = np.zeros(NU, dtype=float)
     prev_script_force = np.zeros(3, dtype=float)
     control_terms_writer = None
     control_terms_file = None
@@ -331,6 +347,9 @@ def main():
                 "term_safety_shaping_rw",
                 "term_safety_shaping_bx",
                 "term_safety_shaping_by",
+                "term_residual_rw",
+                "term_residual_bx",
+                "term_residual_by",
                 "u_cmd_rw",
                 "u_cmd_bx",
                 "u_cmd_by",
@@ -449,6 +468,19 @@ def main():
                     du_hits=du_hits,
                     sat_hits=sat_hits,
                 )
+                residual_step = residual_policy.step(
+                    x_est=x_est,
+                    x_true=x_true,
+                    u_nominal=u_cmd,
+                    u_eff_applied=u_eff_applied,
+                )
+                residual_delta = residual_step.delta_u
+                residual_gate_blocked_count += int(residual_step.gate_blocked)
+                if residual_step.applied:
+                    residual_applied_count += 1
+                    residual_clipped_count += int(residual_step.clipped)
+                    residual_max_abs = np.maximum(residual_max_abs, np.abs(residual_delta))
+                    u_cmd = u_cmd + residual_delta
                 wheel_over_budget_count += int(wheel_over_budget)
                 wheel_over_hard_count += int(wheel_over_hard)
                 u_cmd, upright_blend = apply_upright_postprocess(
@@ -488,6 +520,9 @@ def main():
                             "term_safety_shaping_rw": float(control_terms["term_safety_shaping"][0]),
                             "term_safety_shaping_bx": float(control_terms["term_safety_shaping"][1]),
                             "term_safety_shaping_by": float(control_terms["term_safety_shaping"][2]),
+                            "term_residual_rw": float(residual_delta[0]),
+                            "term_residual_bx": float(residual_delta[1]),
+                            "term_residual_by": float(residual_delta[2]),
                             "u_cmd_rw": float(u_cmd[0]),
                             "u_cmd_bx": float(u_cmd[1]),
                             "u_cmd_by": float(u_cmd[2]),
@@ -647,6 +682,10 @@ def main():
     print(f"Wheel over-budget count: {wheel_over_budget_count}")
     print(f"Wheel over-hard count: {wheel_over_hard_count}")
     print(f"High-spin active ratio: {high_spin_steps / max(step_count, 1):.3f}")
+    print(f"Residual applied rate [updates]: {residual_applied_count / denom:.3f}")
+    print(f"Residual clipped count: {residual_clipped_count}")
+    print(f"Residual gate-blocked count: {residual_gate_blocked_count}")
+    print(f"Residual max |delta_u| [rw,bx,by]: {residual_max_abs}")
 
 
 if __name__ == "__main__":

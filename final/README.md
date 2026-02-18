@@ -16,6 +16,7 @@ It simulates a self-balancing robot in MuJoCo and shows how software can keep a 
 
 - State estimation: linear Kalman correction from noisy IMU/encoder-like channels.
 - Control core: delta-u LQR with runtime safety shaping and mode-specific terms.
+- Optional residual correction: offline-trained PyTorch model adds bounded `delta_u` on top of nominal control (`u = u_nominal + delta_u`), with runtime tilt/rate gating.
 - Safety policies: wheel-speed budget/high-spin latch, base-authority gating, actuator clipping/rate limits, crash-angle stop logic.
 
 ## Not Implemented (Do Not Infer)
@@ -115,14 +116,21 @@ Every control update in `final/final.py` does:
 1. Measure noisy sensor channels (IMU/encoder-like signals).
 2. Estimate current state (Kalman correction).
 3. Compute command increment using delta-u LQR.
-4. Apply saturation/rate limits and safety logic.
-5. Send commands to MuJoCo actuators.
+4. Optionally add residual correction from an offline PyTorch model.
+5. Apply saturation/rate limits and safety logic.
+6. Send commands to MuJoCo actuators.
 
 Core control form:
 - `du = -K * [x; u_prev]`
 - `u = clip(u_prev + du)`
 
 This means it does not jump directly to giant commands; it adjusts smoothly while respecting limits.
+
+Residual correction behavior (optional):
+- It does not replace the controller.
+- It is offline-trained only (no online learning in runtime loop).
+- It is clipped and gated by tilt/rate thresholds.
+- If `delta_u = 0`, behavior falls back to the original controller path.
 
 Safety layers include:
 - wheel speed budget and high-spin recovery latch,
@@ -167,6 +175,12 @@ Install:
 pip install -r requirements.txt
 ```
 
+Optional residual dependency:
+
+```bash
+pip install torch
+```
+
 Run default smooth mode:
 
 ```bash
@@ -197,6 +211,12 @@ Try hardware-like constraints:
 
 ```bash
 python final/final.py --mode robust --real-hardware
+```
+
+Run with optional residual correction:
+
+```bash
+python final/final.py --mode smooth --residual-model path/to/residual.pt --residual-scale 0.20
 ```
 
 ## 8) Implemented Runtime Features
