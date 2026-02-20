@@ -89,6 +89,17 @@ Runtime stack:
 - optional residual correction: offline PyTorch model adds bounded `delta_u` to nominal command
 - safety shaping: saturation and rate limits, wheel-speed budget/high-spin logic, strict hard-speed same-direction suppression, base-authority gating, crash-angle handling
 
+Why recent IMU/sensor realism changes were added:
+- avoid overfitting to idealized state feedback
+- surface long-horizon drift/failure modes earlier (bias + delay + clipping effects)
+- make benchmark robustness claims stronger under non-ideal sensing
+- improve sim-to-real relevance for future embedded deployment
+
+General effect:
+- recovery may look slightly slower/less sharp
+- controllers tuned on ideal sensing may need retuning
+- behavior is more realistic and more representative of hardware constraints
+
 ### 2.2 Controller families in benchmark
 
 - `current`

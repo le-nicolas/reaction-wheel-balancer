@@ -11,13 +11,18 @@ from runtime_model import (
     build_kalman_gain,
     build_measurement_noise_cov,
     build_partial_measurement_matrix,
+    create_sensor_frontend_state,
     compute_robot_com_distance_xy,
     enforce_planar_root_attitude,
     enforce_wheel_only_constraints,
     estimator_measurement_update,
     get_true_state,
+    has_required_mujoco_sensors,
     lookup_model_ids,
+    lookup_sensor_ids,
+    resolve_sensor_source,
     reset_state,
+    reset_sensor_frontend_state,
     set_payload_mass,
 )
 from control_core import (
@@ -112,6 +117,9 @@ def main():
         model.opt.gravity[2] = -6.5
 
     ids = lookup_model_ids(model)
+    sensor_ids = lookup_sensor_ids(model)
+    mujoco_sensor_available = has_required_mujoco_sensors(cfg, sensor_ids)
+    sensor_source = resolve_sensor_source(cfg, sensor_ids)
     payload_mass_kg = set_payload_mass(model, data, ids, cfg.payload_mass_kg)
     push_body_id = {
         "stick": ids.stick_body_id,
@@ -381,6 +389,25 @@ def main():
         f"u={cfg.wheel_only_max_u:.1f} du={cfg.wheel_only_max_du:.1f}"
     )
     print(f"Wheel-rate lsb @ control_dt={control_dt:.6f}s: {wheel_lsb:.6e} rad/s")
+    print(
+        "Sensor frontend: "
+        f"requested={cfg.sensor_source} resolved={sensor_source} "
+        f"mujoco_available={mujoco_sensor_available} "
+        f"sample_hz={cfg.sensor_hz:.1f} delay_steps={cfg.sensor_delay_steps}"
+    )
+    if cfg.sensor_source == "mujoco" and sensor_source != "mujoco":
+        print("Warning: requested --sensor-source mujoco but required named sensors were missing; using direct fallback.")
+    print(
+        "Sensor limits: "
+        f"angle_clip={np.degrees(cfg.imu_angle_clip_rad):.1f}deg "
+        f"rate_clip={cfg.imu_rate_clip_rad_s:.2f}rad/s "
+        f"wheel_clip={cfg.wheel_rate_clip_rad_s:.2f}rad/s"
+    )
+    print(
+        "Sensor LPF: "
+        f"angle={cfg.imu_angle_lpf_hz:.1f}Hz rate={cfg.imu_rate_lpf_hz:.1f}Hz "
+        f"wheel={cfg.wheel_rate_lpf_hz:.1f}Hz base_pos={cfg.base_pos_lpf_hz:.1f}Hz base_vel={cfg.base_vel_lpf_hz:.1f}Hz"
+    )
     print(f"XML ctrlrange low: {XML_CTRL_LOW}")
     print(f"XML ctrlrange high: {XML_CTRL_HIGH}")
     print("\n=== RESIDUAL POLICY ===")
@@ -416,6 +443,8 @@ def main():
     upright_blend = 0.0
     despin_gain = 0.25
     rng = np.random.default_rng(cfg.seed)
+    sensor_frontend_state = create_sensor_frontend_state(cfg)
+    reset_sensor_frontend_state(sensor_frontend_state)
 
     queue_len = 1 if not cfg.hardware_realistic else cfg.control_delay_steps + 1
     (
@@ -596,6 +625,7 @@ def main():
                     high_spin_active,
                     cmd_queue,
                 ) = reset_controller_buffers(NX, NU, queue_len)
+                reset_sensor_frontend_state(sensor_frontend_state)
                 continue
 
             x_pred = A @ x_est + B @ u_eff_applied
@@ -603,7 +633,21 @@ def main():
 
             if step_count % control_steps == 0:
                 control_updates += 1
-                x_est = estimator_measurement_update(cfg, x_true, x_pred, C, L, rng, wheel_lsb)
+                x_est = estimator_measurement_update(
+                    cfg,
+                    x_true,
+                    x_pred,
+                    C,
+                    L,
+                    rng,
+                    wheel_lsb,
+                    data=data,
+                    sensor_ids=sensor_ids,
+                    sensor_source=sensor_source,
+                    sensor_state=sensor_frontend_state,
+                    sim_time_s=float(data.time),
+                    control_dt=control_dt,
+                )
                 angle_mag = max(abs(float(x_true[0])), abs(float(x_true[1])))
                 rate_mag = max(abs(float(x_true[2])), abs(float(x_true[3])))
                 prev_phase = balance_phase
@@ -912,6 +956,7 @@ def main():
                     high_spin_active,
                     cmd_queue,
                 ) = reset_controller_buffers(NX, NU, queue_len)
+                reset_sensor_frontend_state(sensor_frontend_state)
                 continue
 
     if control_terms_file is not None:

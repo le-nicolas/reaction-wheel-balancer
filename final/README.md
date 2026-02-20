@@ -123,6 +123,35 @@ Added `final/mpc_controller.py` and integration into `final/final.py`/`final/con
 7. Drift and tilt hardening.
 Added root attitude clamping, robust DARE fallbacks, terminal cost/rate-target shaping, pitch/roll anti-drift integrators, and pitch rescue logic.
 
+## 3.1) Why We Added Realistic IMU/Sensor Modeling
+
+The previous estimator path was intentionally idealized for fast controller iteration.
+That was useful early, but it can hide problems that appear immediately on hardware.
+
+We added four realism layers in `runtime_model.py` and `final.xml`:
+
+1. Bias drift (random walk) on IMU/encoder channels.
+2. Explicit sensor sample/hold and configurable measurement latency.
+3. Per-channel saturation and low-pass filtering.
+4. MuJoCo named sensor path (`sensordata`) with direct-state fallback.
+
+Why this matters:
+
+1. It exposes slow drift modes earlier.
+Without bias and latency, a controller can look perfect in sim but fail from gradual tilt/wheel drift in longer runs.
+2. It makes estimator confidence more realistic.
+The Kalman update now sees noisier, delayed, and clipped measurements, which is closer to real embedded behavior.
+3. It improves sim-to-real relevance.
+You tune against the failure modes you will actually see on hardware: phase lag, bias accumulation, and sensor ceilings.
+4. It makes benchmark claims stronger.
+Stability under non-ideal sensing is a more meaningful robustness result than stability under near-perfect state access.
+
+General behavior impact you should expect:
+
+1. Slightly slower and less sharp recovery.
+2. More long-horizon drift pressure if gains were tuned for ideal sensing.
+3. Better realism, better transfer value, and clearer tuning tradeoffs.
+
 ## 4) Problems We Hit and How We Solved Them
 
 | Problem observed | Root cause | Fix applied | Where |

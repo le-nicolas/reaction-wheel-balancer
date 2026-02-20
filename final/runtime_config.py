@@ -36,6 +36,24 @@ class RuntimeConfig:
     base_encoder_pos_noise_std_m: float
     base_encoder_vel_noise_std_m_s: float
     base_state_from_sensors: bool
+    sensor_source: str
+    sensor_hz: float
+    sensor_delay_steps: int
+    imu_angle_bias_rw_std_rad_sqrt_s: float
+    imu_rate_bias_rw_std_rad_s_sqrt_s: float
+    wheel_encoder_bias_rw_std_rad_s_sqrt_s: float
+    base_encoder_pos_bias_rw_std_m_sqrt_s: float
+    base_encoder_vel_bias_rw_std_m_s_sqrt_s: float
+    imu_angle_clip_rad: float
+    imu_rate_clip_rad_s: float
+    wheel_rate_clip_rad_s: float
+    base_pos_clip_m: float
+    base_vel_clip_m_s: float
+    imu_angle_lpf_hz: float
+    imu_rate_lpf_hz: float
+    wheel_rate_lpf_hz: float
+    base_pos_lpf_hz: float
+    base_vel_lpf_hz: float
     residual_model_path: str | None
     residual_scale: float
     residual_max_abs_u: np.ndarray
@@ -444,6 +462,114 @@ def parse_args(argv=None):
     parser.add_argument("--imu-rate-noise", type=float, default=0.02)
     parser.add_argument("--wheel-rate-noise", type=float, default=0.01)
     parser.add_argument(
+        "--sensor-source",
+        choices=["auto", "mujoco", "direct"],
+        default="auto",
+        help="Measurement backend: MuJoCo sensordata, direct state, or auto fallback.",
+    )
+    parser.add_argument(
+        "--sensor-hz",
+        type=float,
+        default=None,
+        help="Sensor sample rate in Hz. If omitted, tracks control-hz.",
+    )
+    parser.add_argument(
+        "--sensor-delay-steps",
+        type=int,
+        default=0,
+        help="Additional measurement latency in control updates.",
+    )
+    parser.add_argument(
+        "--imu-angle-bias-rw-deg",
+        type=float,
+        default=0.02,
+        help="IMU angle-bias random walk std (deg/sqrt(s)).",
+    )
+    parser.add_argument(
+        "--imu-rate-bias-rw",
+        type=float,
+        default=0.003,
+        help="IMU rate-bias random walk std ((rad/s)/sqrt(s)).",
+    )
+    parser.add_argument(
+        "--wheel-rate-bias-rw",
+        type=float,
+        default=0.002,
+        help="Wheel-rate bias random walk std ((rad/s)/sqrt(s)).",
+    )
+    parser.add_argument(
+        "--base-pos-bias-rw",
+        type=float,
+        default=3e-4,
+        help="Base-position bias random walk std (m/sqrt(s)).",
+    )
+    parser.add_argument(
+        "--base-vel-bias-rw",
+        type=float,
+        default=0.004,
+        help="Base-velocity bias random walk std ((m/s)/sqrt(s)).",
+    )
+    parser.add_argument(
+        "--imu-angle-clip-deg",
+        type=float,
+        default=85.0,
+        help="IMU angle saturation limit (deg).",
+    )
+    parser.add_argument(
+        "--imu-rate-clip",
+        type=float,
+        default=30.0,
+        help="IMU rate saturation limit (rad/s).",
+    )
+    parser.add_argument(
+        "--wheel-rate-clip",
+        type=float,
+        default=None,
+        help="Wheel-rate sensor saturation limit (rad/s). Defaults to wheel speed limit.",
+    )
+    parser.add_argument(
+        "--base-pos-clip",
+        type=float,
+        default=0.75,
+        help="Base-position sensor saturation limit (m).",
+    )
+    parser.add_argument(
+        "--base-vel-clip",
+        type=float,
+        default=6.0,
+        help="Base-velocity sensor saturation limit (m/s).",
+    )
+    parser.add_argument(
+        "--imu-angle-lpf-hz",
+        type=float,
+        default=45.0,
+        help="First-order LPF cutoff for IMU angle channels (Hz).",
+    )
+    parser.add_argument(
+        "--imu-rate-lpf-hz",
+        type=float,
+        default=70.0,
+        help="First-order LPF cutoff for IMU rate channels (Hz).",
+    )
+    parser.add_argument(
+        "--wheel-rate-lpf-hz",
+        type=float,
+        default=120.0,
+        help="First-order LPF cutoff for wheel-rate channel (Hz).",
+    )
+    parser.add_argument(
+        "--base-pos-lpf-hz",
+        type=float,
+        default=25.0,
+        help="First-order LPF cutoff for base-position channels (Hz).",
+    )
+    parser.add_argument(
+        "--base-vel-lpf-hz",
+        type=float,
+        default=40.0,
+        help="First-order LPF cutoff for base-velocity channels (Hz).",
+    )
+    parser.add_argument(
         "--base-pos-noise",
         type=float,
         default=0.0015,
@@ -797,6 +923,15 @@ def build_config(args) -> RuntimeConfig:
         control_delay_steps = 0
     if real_hardware_profile:
         control_delay_steps = max(control_delay_steps, 1)
+    sensor_source = str(getattr(args, "sensor_source", "auto")).strip().lower()
+    if sensor_source not in {"auto", "mujoco", "direct"}:
+        sensor_source = "auto"
+    sensor_hz_arg = getattr(args, "sensor_hz", None)
+    if sensor_hz_arg is None:
+        sensor_hz = max(control_hz, 1.0)
+    else:
+        sensor_hz = max(float(sensor_hz_arg), 1.0)
+    sensor_delay_steps = max(int(getattr(args, "sensor_delay_steps", 0)), 0)
 
     residual_scale = float(max(getattr(args, "residual_scale", 0.0), 0.0))
     residual_max_abs_u = np.array(
@@ -845,6 +980,28 @@ def build_config(args) -> RuntimeConfig:
         base_encoder_pos_noise_std_m=float(max(args.base_pos_noise, 0.0)),
         base_encoder_vel_noise_std_m_s=float(max(args.base_vel_noise, 0.0)),
         base_state_from_sensors=bool((not args.legacy_model) or real_hardware_profile),
+        sensor_source=sensor_source,
+        sensor_hz=sensor_hz,
+        sensor_delay_steps=sensor_delay_steps,
+        imu_angle_bias_rw_std_rad_sqrt_s=float(np.radians(max(args.imu_angle_bias_rw_deg, 0.0))),
+        imu_rate_bias_rw_std_rad_s_sqrt_s=float(max(args.imu_rate_bias_rw, 0.0)),
+        wheel_encoder_bias_rw_std_rad_s_sqrt_s=float(max(args.wheel_rate_bias_rw, 0.0)),
+        base_encoder_pos_bias_rw_std_m_sqrt_s=float(max(args.base_pos_bias_rw, 0.0)),
+        base_encoder_vel_bias_rw_std_m_s_sqrt_s=float(max(args.base_vel_bias_rw, 0.0)),
+        imu_angle_clip_rad=float(np.radians(max(args.imu_angle_clip_deg, 1e-3))),
+        imu_rate_clip_rad_s=float(max(args.imu_rate_clip, 1e-3)),
+        wheel_rate_clip_rad_s=float(
+            max(float(args.wheel_rate_clip), 1e-3)
+            if args.wheel_rate_clip is not None
+            else max(max_wheel_speed_rad_s, 1e-3)
+        ),
+        base_pos_clip_m=float(max(args.base_pos_clip, 1e-4)),
+        base_vel_clip_m_s=float(max(args.base_vel_clip, 1e-4)),
+        imu_angle_lpf_hz=float(max(args.imu_angle_lpf_hz, 0.0)),
+        imu_rate_lpf_hz=float(max(args.imu_rate_lpf_hz, 0.0)),
+        wheel_rate_lpf_hz=float(max(args.wheel_rate_lpf_hz, 0.0)),
+        base_pos_lpf_hz=float(max(args.base_pos_lpf_hz, 0.0)),
+        base_vel_lpf_hz=float(max(args.base_vel_lpf_hz, 0.0)),
         residual_model_path=(str(getattr(args, "residual_model", "")) if getattr(args, "residual_model", None) else None),
         residual_scale=residual_scale,
         residual_max_abs_u=residual_max_abs_u,

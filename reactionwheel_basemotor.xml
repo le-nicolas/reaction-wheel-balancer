@@ -1,61 +1,122 @@
 <mujoco model="wheel_on_stick">
+    <compiler angle="radian"/>
     <option timestep="0.001" gravity="0 0 -9.81"/>
 
+    <asset>
+        <texture name="sky" type="skybox" builtin="gradient"
+                 rgb1="0.70 0.79 0.90" rgb2="0.96 0.98 1.00"
+                 width="512" height="3072"/>
+        <texture name="ground_tex" type="2d" builtin="checker"
+                 rgb1="0.28 0.32 0.27" rgb2="0.20 0.24 0.20"
+                 width="512" height="512"/>
+        <material name="ground_mat" texture="ground_tex"
+                  texrepeat="10 10" reflectance="0.08"
+                  specular="0.10" shininess="0.20"/>
+        <material name="stick_mat" rgba="0.14 0.16 0.19 1.0"
+                  specular="0.20" shininess="0.28"/>
+        <material name="wheel_mat" rgba="0.82 0.84 0.87 1.0"
+                  specular="0.80" shininess="0.90"/>
+        <material name="hub_mat" rgba="0.10 0.10 0.11 1.0"
+                  specular="0.30" shininess="0.50"/>
+        <material name="base_mat" rgba="0.18 0.20 0.22 1.0"
+                  specular="0.25" shininess="0.35"/>
+    </asset>
+
     <visual>
-        <map znear="0.001" zfar="50"/>
+        <map znear="0.001" zfar="80"/>
+        <headlight ambient="0.30 0.30 0.33"
+                   diffuse="0.62 0.62 0.62"
+                   specular="0.20 0.20 0.20"/>
+        <rgba haze="0.88 0.93 1.00 1"/>
     </visual>
 
     <worldbody>
-        <!-- Camera -->
+        <light name="sun" pos="3 -5 6"
+               dir="-0.4 0.6 -1"
+               directional="true"
+               castshadow="true"
+               diffuse="0.95 0.95 0.92"
+               specular="0.15 0.15 0.15"/>
+        <light name="fill" pos="-3 2 3"
+               directional="false"
+               castshadow="false"
+               diffuse="0.35 0.38 0.45"
+               specular="0 0 0"/>
+
+        <geom name="ground" type="plane"
+              size="40 40 0.1"
+              material="ground_mat"
+              friction="1.2 0.04 0.002"/>
+
+        <!-- Visual pedestal under the hinge -->
+        <geom name="pedestal" type="cylinder"
+              pos="0 0 0.14"
+              size="0.12 0.14"
+              contype="0" conaffinity="0"
+              material="base_mat"/>
+
         <camera name="side"
-                pos="0 -4 1.5"
+                pos="0 -4 1.7"
                 quat="0.9239 0.3827 0 0"/>
 
-        <!-- Stick -->
         <body name="stick" pos="0 0 0.3">
             <joint name="stick_hinge"
                    type="hinge"
                    axis="0 1 0"
-                   damping="0.5"/>
+                   damping="1.2"
+                   armature="0.025"
+                   frictionloss="0.03"/>
 
-            <geom type="capsule"
+            <geom name="stick_geom" type="capsule"
                   fromto="0 0 0  0 0 2"
-                  mass="1.0"
-                  size="0.05"
+                  mass="1.2"
+                  size="0.045"
+                  material="stick_mat"
                   contype="0"
                   conaffinity="0"/>
 
-            <!-- Reaction Wheel -->
+            <!-- Small physical mass near the base to avoid an unrealistically top-heavy link -->
+            <geom name="base_counterweight" type="sphere"
+                  pos="0 0 0.06"
+                  size="0.06"
+                  mass="0.45"
+                  material="hub_mat"
+                  contype="0"
+                  conaffinity="0"/>
+
             <body name="wheel" pos="0 0 2">
                 <joint name="wheel_spin"
                        type="hinge"
                        axis="0 1 0"
-                       damping="0.0"/>
+                       damping="0.08"
+                       armature="0.01"
+                       frictionloss="0.002"/>
 
-                <!-- Rim -->
-                <geom type="cylinder"
-                      size="0.3 0.02"
-                      mass="3.0"
+                <geom name="wheel_rim" type="cylinder"
+                      size="0.28 0.02"
+                      mass="2.6"
                       quat="0.7071 0.7071 0 0"
+                      material="wheel_mat"
                       contype="0"
                       conaffinity="0"/>
 
-                <!-- Hub -->
-                <geom type="sphere"
+                <geom name="wheel_hub" type="sphere"
                       size="0.07"
-                      rgba="0.2 0.2 0.2 1"/>
+                      mass="0.25"
+                      material="hub_mat"
+                      contype="0"
+                      conaffinity="0"/>
             </body>
         </body>
     </worldbody>
 
-    <!-- Actuators -->
     <actuator>
-        <!-- Reaction wheel motor -->
-        <motor joint="wheel_spin"
+        <motor name="wheel_motor"
+               joint="wheel_spin"
                ctrlrange="-1000 1000"/>
 
-        <!-- Base (stick hinge) motor -->
-        <motor joint="stick_hinge"
+        <motor name="base_motor"
+               joint="stick_hinge"
                ctrlrange="-200 200"/>
     </actuator>
 </mujoco>

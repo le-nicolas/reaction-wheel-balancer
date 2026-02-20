@@ -472,4 +472,17 @@
                ctrlrange="-100 100"/>
 
     </actuator>
+
+    <sensor>
+        <!-- Estimator channels: named sensors consumed by runtime_model.lookup_sensor_ids. -->
+        <jointpos name="imu_pitch_angle" joint="stick_pitch"/>
+        <jointpos name="imu_roll_angle" joint="stick_roll"/>
+        <jointvel name="imu_pitch_rate" joint="stick_pitch"/>
+        <jointvel name="imu_roll_rate" joint="stick_roll"/>
+        <jointvel name="wheel_rate_sensor" joint="wheel_spin"/>
+        <jointpos name="base_x_pos_sensor" joint="base_x_slide"/>
+        <jointpos name="base_y_pos_sensor" joint="base_y_slide"/>
+        <jointvel name="base_x_vel_sensor" joint="base_x_slide"/>
+        <jointvel name="base_y_vel_sensor" joint="base_y_slide"/>
+    </sensor>
 </mujoco>
