@@ -1038,6 +1038,9 @@ def main():
                 print(
                     f"\nCRASH #{crash_count} at step {step_count}: "
                     f"pitch={np.degrees(pitch):.2f}deg roll={np.degrees(roll):.2f}deg "
+                    f"pitch_rate={float(data.qvel[ids.v_pitch]):.3f}rad/s "
+                    f"roll_rate={float(data.qvel[ids.v_roll]):.3f}rad/s "
+                    f"wheel_rate={float(data.qvel[ids.v_rw]):.2f}rad/s "
                     f"com_xy={com_planar_dist:.3f}m "
                     f"reason={'com_overload' if com_failed else ('pitch_tilt' if pitch_failed else 'roll_tilt')}"
                 )

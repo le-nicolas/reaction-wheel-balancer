@@ -359,6 +359,14 @@ Tune `--mpc-pitch-guard-angle-frac`, `--mpc-pitch-guard-rate`, `--mpc-pitch-guar
 6. Validate with both nominal and stressed runs.
 Use scripted pushes and benchmark seeds, not only one clean viewer run.
 
+### 7.1 Current Pitch-Urgency Defaults
+
+Current fast-failure prevention tuning focuses on earlier pitch correction:
+
+1. RW `max_du` is kept at baseline defaults (no extra delta-u widening).
+2. LQR pitch-angle weight (`Qx[0,0]`) is increased by ~2.5x so pitch growth is treated as urgent much earlier.
+3. Crash console output includes `pitch_rate`, `roll_rate`, and `wheel_rate` at failure time to distinguish gain vs authority-limit issues.
+
 ## 8) Important Boundaries
 
 1. This is simulation-first engineering work, not a hardware safety certification.

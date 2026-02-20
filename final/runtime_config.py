@@ -776,7 +776,7 @@ def build_config(args) -> RuntimeConfig:
     if smooth_viewer:
         qx = np.diag(
             [
-                95.0 * 1.8881272496398052,
+                240.0 * 1.8881272496398052,
                 75.0 * 1.8881272496398052,
                 40.0 * 4.365896739242128,
                 28.0 * 4.365896739242128,
@@ -821,7 +821,7 @@ def build_config(args) -> RuntimeConfig:
         wheel_only_max_u = 40.0
         wheel_only_max_du = 8.0
     else:
-        qx = np.diag([120.0, 90.0, 70.0, 50.0, 1.0, 220.0, 220.0, 520.0, 520.0])
+        qx = np.diag([300.0, 90.0, 70.0, 50.0, 1.0, 220.0, 220.0, 520.0, 520.0])
         qu = np.diag([1e-3, 0.08, 0.08])
         r_du = np.diag([3.0, 0.8, 0.8])
         max_u = np.array([100.0, 14.0, 14.0])
