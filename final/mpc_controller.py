@@ -41,6 +41,7 @@ class MPCController:
         horizon: int = 25,
         q_diag: np.ndarray = None,
         r_diag: np.ndarray = None,
+        terminal_weight: float = 1.0,
         u_max: np.ndarray = None,
         com_radius_m: float = 0.145,
         angle_max_rad: float = 0.5,
@@ -55,6 +56,7 @@ class MPCController:
             horizon: Prediction horizon in steps (default 25 = 100ms at 250Hz)
             q_diag: Diagonal of state cost Q (default: balance angle/rate control)
             r_diag: Diagonal of control cost R (default: penalize large forces)
+            terminal_weight: Terminal cost scaling, Qf = terminal_weight * Q
             u_max: Maximum control inputs [wheel_torque, base_x_force, base_y_force]
             com_radius_m: Maximum COM distance from origin (support radius)
             angle_max_rad: Maximum allowed pitch/roll angle
@@ -77,6 +79,7 @@ class MPCController:
         
         self.Q = np.diag(q_diag)
         self.R = np.diag(r_diag)
+        self.Qf = float(max(terminal_weight, 1.0)) * self.Q
         
         # Constraint bounds
         if u_max is None:
@@ -117,7 +120,7 @@ class MPCController:
         nu = self.nu
         
         # Build cost matrices: P (Hessian) and q (gradient)
-        Q_blk = block_diag(*[self.Q] * (N + 1))  # State costs for horizon
+        Q_blk = block_diag(*([self.Q] * N + [self.Qf]))  # State costs + terminal cost
         R_blk = block_diag(*[self.R] * N)         # Control costs for horizon
         
         # P = 2 * block_diag(Q_blk, R_blk) for hessian (symmetric)
@@ -155,16 +158,22 @@ class MPCController:
         
         
         # Input bounds: -u_max <= u <= u_max
+        #
+        # In OSQP form (l <= A z <= u), we encode this as two one-sided sets:
+        #   1) u >= -u_max  -> I * u >= -u_max
+        #   2) u <=  u_max  -> I * u <=  u_max
+        #
+        # Using +/-inf on the unused side avoids accidentally constraining u to 0.
         A_u = np.zeros((2 * N * nu, (N + 1) * nx + N * nu))
-        l_u = np.zeros(2 * N * nu)
-        u_u = np.zeros(2 * N * nu)
+        l_u = np.full(2 * N * nu, -np.inf)
+        u_u = np.full(2 * N * nu, np.inf)
         
         for k in range(N):
             col_u_k = (N + 1) * nx + k * nu
-            # u >= -u_max
+            # Lower bound: u >= -u_max
             A_u[2 * k * nu:(2 * k + 1) * nu, col_u_k:col_u_k + nu] = np.eye(nu)
             l_u[2 * k * nu:(2 * k + 1) * nu] = -self.u_max
-            # u <= u_max
+            # Upper bound: u <= u_max
             A_u[(2 * k + 1) * nu:(2 * k + 2) * nu, col_u_k:col_u_k + nu] = np.eye(nu)
             u_u[(2 * k + 1) * nu:(2 * k + 2) * nu] = self.u_max
         
@@ -286,10 +295,21 @@ class MPCController:
             print(f"OSQP initialization failed: {e}")
             self.solver = None
     
+    def _build_tracking_vector(self, x_ref: np.ndarray, x_ref_terminal: np.ndarray) -> np.ndarray:
+        """Linear tracking term with separate terminal target."""
+        q_track = np.zeros((self.N + 1) * self.nx + self.N * self.nu)
+        for k in range(self.N):
+            idx = k * self.nx
+            q_track[idx:idx + self.nx] = -2 * self.Q @ x_ref
+        idx_n = self.N * self.nx
+        q_track[idx_n:idx_n + self.nx] = -2 * self.Qf @ x_ref_terminal
+        return q_track
+
     def solve(
         self,
         x_current: np.ndarray,
         x_ref: Optional[np.ndarray] = None,
+        x_ref_terminal: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, dict]:
         """
         Solve MPC problem for current state and return optimal control.
@@ -297,7 +317,8 @@ class MPCController:
         Args:
             x_current: Current state estimate [pitch, roll, pitch_rate, roll_rate, 
                        wheel_rate, base_x, base_y, base_vel_x, base_vel_y]
-            x_ref: Reference state (default: upright at origin)
+            x_ref: Running reference state (default: upright at origin)
+            x_ref_terminal: Terminal reference state (defaults to x_ref)
         
         Returns:
             u_opt: Optimal control command [wheel_torque, base_x_force, base_y_force]
@@ -305,26 +326,15 @@ class MPCController:
         """
         if x_ref is None:
             x_ref = np.zeros(self.nx)
+        if x_ref_terminal is None:
+            x_ref_terminal = x_ref
         
         start_time = time.time()
-        
-        # Update cost function with PROPER error tracking
-        # The cost is: 0.5 * sum_k ||x_k - x_ref||_Q^2 + sum_k ||u_k||_R^2
-        # In QP form: 0.5 z^T P z + q^T z
-        # where P = diag(Q, ..., Q, R, ..., R) (already set in _build_qp_matrices)
-        # and q = [-2 Q x_ref, -2 Q x_ref, ..., 0, ..., 0]
-        # 
-        # With LQR delta-u formulation, we need to track x_ref for state cost,
-        # which creates the linear term: q = -2 * [Q@x_ref for each timestep]
-        q_track = np.zeros((self.N + 1) * self.nx + self.N * self.nu)
-        for k in range(self.N + 1):
-            idx = k * self.nx
-            # Reference tracking: -2 * Q * x_ref (this is the linear cost term from expanded quadratic)
-            q_track[idx:idx + self.nx] = -2 * self.Q @ x_ref
+        q_track = self._build_tracking_vector(x_ref, x_ref_terminal)
         
         if self.solver is None:
             # Fallback to numerical optimization
-            u_opt = self._solve_scipy(x_current, x_ref)
+            u_opt = self._solve_scipy(x_current, x_ref, x_ref_terminal)
             solve_time = time.time() - start_time
             return u_opt, {
                 "solve_time_ms": solve_time * 1000,
@@ -352,11 +362,7 @@ class MPCController:
             ])
             
             # Update cost to track reference
-            q_track = np.zeros((self.N + 1) * self.nx + self.N * self.nu)
-            for k in range(self.N + 1):
-                idx = k * self.nx
-                # Reference tracking: -2 * Q * x_ref (this is the linear cost term from expanded quadratic)
-                q_track[idx:idx + self.nx] = -2 * self.Q @ x_ref
+            q_track = self._build_tracking_vector(x_ref, x_ref_terminal)
             
             # Update solver
             self.solver.update(q=q_track, l=l_all, u=u_all)
@@ -401,6 +407,7 @@ class MPCController:
         self,
         x_current: np.ndarray,
         x_ref: np.ndarray,
+        x_ref_terminal: np.ndarray,
     ) -> Optional[np.ndarray]:
         """
         Fallback solver using scipy.optimize when OSQP unavailable.
@@ -412,7 +419,9 @@ class MPCController:
             u = z[(self.N + 1) * self.nx:]
             
             # State cost
-            state_error = x - np.tile(x_ref, self.N + 1)
+            x_ref_stack = np.tile(x_ref, self.N + 1)
+            x_ref_stack[self.N * self.nx:(self.N + 1) * self.nx] = x_ref_terminal
+            state_error = x - x_ref_stack
             state_cost = state_error @ self.P[:self.nx * (self.N + 1), :self.nx * (self.N + 1)] @ state_error
             
             # Control cost

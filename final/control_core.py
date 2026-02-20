@@ -184,25 +184,179 @@ def compute_control_command(
     # ========== MPC PATH (if enabled) ==========
     if cfg.use_mpc and mpc_controller is not None:
         # MPC solves the constrained optimization problem directly
-        u_mpc, mpc_info = mpc_controller.solve(x_ctrl)
-        
-        # Clip and apply MPC output
-        u_rw_cmd = float(np.clip(u_mpc[0], -cfg.max_u[0], cfg.max_u[0]))
-        u_base_cmd = np.clip(u_mpc[1:], -cfg.max_u[1:], cfg.max_u[1:])
-        
+        # State-target shaping: convert angle error into desired damping rates.
+        # This helps avoid monotonic backward tilt while keeping upright target at zero.
+        x_ref = np.zeros_like(x_ctrl)
+        rate_clip = float(max(cfg.mpc_target_rate_clip_rad_s, 0.0))
+        run_rate_gain = float(max(cfg.mpc_target_rate_gain, 0.0))
+        term_rate_gain = float(max(cfg.mpc_terminal_rate_gain, 0.0))
+        if rate_clip > 0.0:
+            x_ref[2] = float(np.clip(-run_rate_gain * x_ctrl[0], -rate_clip, rate_clip))
+            x_ref[3] = float(np.clip(-run_rate_gain * x_ctrl[1], -rate_clip, rate_clip))
+        x_ref_terminal = x_ref.copy()
+        if rate_clip > 0.0:
+            x_ref_terminal[2] = float(np.clip(-term_rate_gain * x_ctrl[0], -rate_clip, rate_clip))
+            x_ref_terminal[3] = float(np.clip(-term_rate_gain * x_ctrl[1], -rate_clip, rate_clip))
+
+        u_mpc, mpc_info = mpc_controller.solve(
+            x_ctrl,
+            x_ref=x_ref,
+            x_ref_terminal=x_ref_terminal,
+        )
+        mpc_success = bool(mpc_info.get("success", False))
+        if not mpc_success:
+            # Runtime fallback: if QP fails, use clipped one-step linear feedback instead of zeroing commands.
+            z_fb = np.concatenate([x_ctrl, u_eff_applied])
+            du_fb = -K_du @ z_fb
+            du_fb = np.clip(du_fb, -cfg.max_du, cfg.max_du)
+            u_mpc = np.clip(u_eff_applied + du_fb, -cfg.max_u, cfg.max_u)
+            terms["term_lqr_core"] = np.array([du_fb[0], du_fb[1], du_fb[2]], dtype=float)
+
+        # MPC pitch anti-drift integral: adds bounded bias to wheel channel.
+        # This compensates slow model mismatch that appears as monotonic pitch drift.
+        i_term = 0.0
+        if cfg.mpc_pitch_i_gain > 0.0 and cfg.mpc_pitch_i_clamp > 0.0:
+            pitch_err = float(x_ctrl[0])
+            deadband = float(cfg.mpc_pitch_i_deadband_rad)
+            if abs(pitch_err) > deadband:
+                err_for_i = pitch_err - np.sign(pitch_err) * deadband
+                wheel_pitch_int = float(
+                    np.clip(
+                        wheel_pitch_int + err_for_i * control_dt,
+                        -cfg.mpc_pitch_i_clamp,
+                        cfg.mpc_pitch_i_clamp,
+                    )
+                )
+            else:
+                # Leak the integrator near upright to prevent bias memory buildup.
+                leak = float(np.clip(cfg.mpc_pitch_i_leak_per_s * control_dt, 0.0, 1.0))
+                wheel_pitch_int = float((1.0 - leak) * wheel_pitch_int)
+            i_term = float(-cfg.mpc_pitch_i_gain * wheel_pitch_int)
+
+        # Pitch rescue guard: blend in aggressive wheel PD when pitch is trending to crash.
+        # This is a safety override layered on MPC to catch late-time pitch drift.
+        u_rw_nom = float(u_mpc[0] + i_term)
+        u_rw_raw = u_rw_nom
+        pitch_guard_active = False
+        pitch_guard_severity = 0.0
+        rescue_base_x = 0.0
+        pitch = float(x_ctrl[0])
+        pitch_rate = float(x_ctrl[2])
+        guard_angle = float(cfg.mpc_pitch_guard_angle_frac * cfg.crash_angle_rad)
+        guard_angle = float(np.clip(guard_angle, 1e-4, max(cfg.crash_angle_rad - 1e-4, 1e-4)))
+        guard_rate = float(max(cfg.mpc_pitch_guard_rate_entry_rad_s, 0.0))
+        moving_out = (
+            abs(pitch_rate) > guard_rate
+            and abs(pitch) > 0.5 * guard_angle
+            and np.sign(pitch_rate) == np.sign(pitch)
+        )
+        if abs(pitch) >= guard_angle or moving_out:
+            pitch_guard_active = True
+            sev_angle = float(
+                np.clip((abs(pitch) - guard_angle) / max(cfg.crash_angle_rad - guard_angle, 1e-6), 0.0, 1.0)
+            )
+            sev_rate = 0.0
+            if guard_rate > 1e-9:
+                sev_rate = float(np.clip((abs(pitch_rate) - guard_rate) / guard_rate, 0.0, 1.0))
+            pitch_guard_severity = float(np.clip(max(sev_angle, 0.6 * sev_rate), 0.0, 1.0))
+            rescue_raw = float(-(cfg.mpc_pitch_guard_kp * pitch + cfg.mpc_pitch_guard_kd * pitch_rate))
+            rescue_lim = float(cfg.mpc_pitch_guard_max_frac * cfg.max_u[0])
+            rescue_cmd = float(np.clip(rescue_raw, -rescue_lim, rescue_lim))
+            u_rw_raw = float((1.0 - pitch_guard_severity) * u_rw_nom + pitch_guard_severity * rescue_cmd)
+            rescue_base_x = float(
+                np.clip(
+                    cfg.base_command_gain * (cfg.base_pitch_kp * pitch + cfg.base_pitch_kd * pitch_rate),
+                    -cfg.max_u[1],
+                    cfg.max_u[1],
+                )
+            )
+            terms["term_pitch_stability"][0] += float(u_rw_raw - u_rw_nom)
+
+        # Clip and apply MPC output (with integral bias and optional rescue blend).
+        u_rw_cmd = float(np.clip(u_rw_raw, -cfg.max_u[0], cfg.max_u[0]))
+        # Roll anti-drift integral uses base_int[1] state slot in MPC mode.
+        # It provides slow bias correction on the roll actuator channel.
+        i_roll_term = 0.0
+        if cfg.mpc_roll_i_gain > 0.0 and cfg.mpc_roll_i_clamp > 0.0:
+            roll_err = float(x_ctrl[1])
+            deadband_r = float(cfg.mpc_roll_i_deadband_rad)
+            if abs(roll_err) > deadband_r:
+                err_for_i_r = roll_err - np.sign(roll_err) * deadband_r
+                base_int[1] = float(
+                    np.clip(
+                        base_int[1] + err_for_i_r * control_dt,
+                        -cfg.mpc_roll_i_clamp,
+                        cfg.mpc_roll_i_clamp,
+                    )
+                )
+            else:
+                leak_r = float(np.clip(cfg.mpc_roll_i_leak_per_s * control_dt, 0.0, 1.0))
+                base_int[1] = float((1.0 - leak_r) * base_int[1])
+            i_roll_term = float(-cfg.mpc_roll_i_gain * base_int[1])
+
+        u_base_raw = np.array([float(u_mpc[1]), float(u_mpc[2] + i_roll_term)], dtype=float)
+        # Always provide a small pitch-support bias on base-x in MPC mode.
+        # Scale grows with pitch-integrator magnitude so persistent drift is corrected earlier.
+        drift_level = float(np.clip(abs(wheel_pitch_int) / max(cfg.mpc_pitch_i_clamp, 1e-6), 0.0, 1.0))
+        support_scale = float(0.10 + 0.35 * drift_level)
+        pitch_base_support = float(
+            np.clip(
+                support_scale * cfg.base_command_gain * (cfg.base_pitch_kp * pitch + cfg.base_pitch_kd * pitch_rate),
+                -0.50 * cfg.max_u[1],
+                0.50 * cfg.max_u[1],
+            )
+        )
+        u_base_raw[0] += pitch_base_support
+        terms["term_pitch_stability"][1] += pitch_base_support
+        if pitch_guard_active:
+            # During pitch rescue, prioritize base-x support and reduce lateral command coupling.
+            base_blend = float(np.clip(0.35 + 0.65 * pitch_guard_severity, 0.0, 1.0))
+            base_x_nom = float(u_base_raw[0])
+            base_y_nom = float(u_base_raw[1])
+            u_base_raw[0] = float((1.0 - base_blend) * base_x_nom + base_blend * rescue_base_x)
+            y_keep = float(np.clip(1.0 - 0.45 * pitch_guard_severity, 0.45, 1.0))
+            u_base_raw[1] = float(y_keep * u_base_raw[1])
+            terms["term_pitch_stability"][1] += float(u_base_raw[0] - base_x_nom)
+            terms["term_pitch_stability"][2] += float(u_base_raw[1] - base_y_nom)
+        u_base_cmd = np.clip(u_base_raw, -cfg.max_u[1:], cfg.max_u[1:])
+
+        # Back-calculation anti-windup for integrator when wheel channel clips.
+        if cfg.mpc_pitch_i_gain > 1e-9:
+            sat_excess = float(u_rw_raw - u_rw_cmd)
+            if abs(sat_excess) > 1e-12:
+                wheel_pitch_int = float(
+                    np.clip(
+                        wheel_pitch_int + sat_excess / cfg.mpc_pitch_i_gain,
+                        -cfg.mpc_pitch_i_clamp,
+                        cfg.mpc_pitch_i_clamp,
+                    )
+                )
+        if cfg.mpc_roll_i_gain > 1e-9:
+            sat_excess_r = float(u_base_raw[1] - u_base_cmd[1])
+            if abs(sat_excess_r) > 1e-12:
+                base_int[1] = float(
+                    np.clip(
+                        base_int[1] + sat_excess_r / cfg.mpc_roll_i_gain,
+                        -cfg.mpc_roll_i_clamp,
+                        cfg.mpc_roll_i_clamp,
+                    )
+                )
+
         # Record to terms for logging
         terms["term_mpc"] = u_mpc
-        
+        terms["term_pitch_stability"][0] += i_term
+        terms["term_roll_stability"][2] += i_roll_term
+
         # Handle saturation hits
-        sat_hits[0] += int(abs(u_mpc[0]) > cfg.max_u[0])
-        sat_hits[1:] += (np.abs(u_mpc[1:]) > cfg.max_u[1:]).astype(int)
-        
+        sat_hits[0] += int(abs(u_rw_raw) > cfg.max_u[0])
+        sat_hits[1:] += (np.abs(u_base_raw) > cfg.max_u[1:]).astype(int)
+
         # Return MPC result in same format as LQR path
         u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
         rw_u_limit = cfg.max_u[0]
         wheel_over_budget = False  # MPC handles constraints explicitly
         wheel_over_hard = False
-        
+
         return (
             u_cmd,
             base_int,

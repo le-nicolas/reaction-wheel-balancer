@@ -9,6 +9,7 @@ import mujoco
 import numpy as np
 from scipy.linalg import LinAlgError, solve_discrete_are
 import runtime_config as runtime_cfg
+from mpc_controller import MPCController
 
 
 @dataclass
@@ -312,6 +313,7 @@ class ControllerEvaluator:
         self.HOLD_WHEEL_DESPIN_SCALE = float(cfg.hold_wheel_despin_scale)
         self.UPRIGHT_BLEND_RISE = float(cfg.upright_blend_rise)
         self.UPRIGHT_BLEND_FALL = float(cfg.upright_blend_fall)
+        self.lock_root_attitude = bool(getattr(cfg, "lock_root_attitude", True))
         self.base_integrator_enabled = bool(cfg.base_integrator_enabled)
 
     def _resolve_ids(self):
@@ -326,47 +328,72 @@ class ControllerEvaluator:
         self.jid_rw = jid("wheel_spin")
         self.jid_base_x = jid("base_x_slide")
         self.jid_base_y = jid("base_y_slide")
+        self.jid_base_free = jid("base_free")
+        qadr_base_free = int(self.model.jnt_qposadr[self.jid_base_free])
+        dadr_base_free = int(self.model.jnt_dofadr[self.jid_base_free])
 
         self.q_pitch = self.model.jnt_qposadr[self.jid_pitch]
         self.q_roll = self.model.jnt_qposadr[self.jid_roll]
         self.q_base_x = self.model.jnt_qposadr[self.jid_base_x]
         self.q_base_y = self.model.jnt_qposadr[self.jid_base_y]
+        self.q_base_quat_w = qadr_base_free + 3
+        self.q_base_quat_x = qadr_base_free + 4
+        self.q_base_quat_y = qadr_base_free + 5
+        self.q_base_quat_z = qadr_base_free + 6
 
         self.v_pitch = self.model.jnt_dofadr[self.jid_pitch]
         self.v_roll = self.model.jnt_dofadr[self.jid_roll]
         self.v_rw = self.model.jnt_dofadr[self.jid_rw]
         self.v_base_x = self.model.jnt_dofadr[self.jid_base_x]
         self.v_base_y = self.model.jnt_dofadr[self.jid_base_y]
+        self.v_base_ang_x = dadr_base_free + 3
+        self.v_base_ang_y = dadr_base_free + 4
+        self.v_base_ang_z = dadr_base_free + 5
 
         self.aid_rw = aid("wheel_spin")
         self.aid_base_x = aid("base_x_force")
         self.aid_base_y = aid("base_y_force")
         self.stick_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "stick")
 
+    def _enforce_planar_root_attitude(self, do_forward: bool = True) -> None:
+        # Keep the free-joint attitude upright to remove unmodeled tumble drift.
+        self.data.qpos[self.q_base_quat_w] = 1.0
+        self.data.qpos[self.q_base_quat_x] = 0.0
+        self.data.qpos[self.q_base_quat_y] = 0.0
+        self.data.qpos[self.q_base_quat_z] = 0.0
+        self.data.qvel[self.v_base_ang_x] = 0.0
+        self.data.qvel[self.v_base_ang_y] = 0.0
+        self.data.qvel[self.v_base_ang_z] = 0.0
+        if do_forward:
+            mujoco.mj_forward(self.model, self.data)
+
     def _linearize(self):
-        self.data.qpos[:] = 0.0
+        self.data.qpos[:] = self.model.qpos0
         self.data.qvel[:] = 0.0
         self.data.ctrl[:] = 0.0
         self.data.qpos[self.q_pitch] = self.PITCH_EQ
         self.data.qpos[self.q_roll] = self.ROLL_EQ
+        if self.lock_root_attitude:
+            self._enforce_planar_root_attitude(do_forward=False)
         mujoco.mj_forward(self.model, self.data)
 
-        nx = self.model.nq + self.model.nv
+        nx = 2 * self.model.nv + self.model.na
         nu = self.model.nu
         A_full = np.zeros((nx, nx))
         B_full = np.zeros((nx, nu))
         mujoco.mjd_transitionFD(self.model, self.data, 1e-6, True, A_full, B_full, None, None)
 
+        # mjd_transitionFD uses tangent-space position coordinates (size nv), not qpos (size nq).
         idx = [
-            self.q_pitch,
-            self.q_roll,
-            self.model.nq + self.v_pitch,
-            self.model.nq + self.v_roll,
-            self.model.nq + self.v_rw,
-            self.q_base_x,
-            self.q_base_y,
-            self.model.nq + self.v_base_x,
-            self.model.nq + self.v_base_y,
+            self.v_pitch,
+            self.v_roll,
+            self.model.nv + self.v_pitch,
+            self.model.nv + self.v_roll,
+            self.model.nv + self.v_rw,
+            self.v_base_x,
+            self.v_base_y,
+            self.model.nv + self.v_base_x,
+            self.model.nv + self.v_base_y,
         ]
         A = A_full[np.ix_(idx, idx)]
         B = B_full[np.ix_(idx, [self.aid_rw, self.aid_base_x, self.aid_base_y])]
@@ -453,7 +480,7 @@ class ControllerEvaluator:
             raise ValueError("XML actuator ctrlrange is tighter than MAX_U.")
 
     def _reset_with_initial_state(self, rng: np.random.Generator, config: EpisodeConfig):
-        self.data.qpos[:] = 0.0
+        self.data.qpos[:] = self.model.qpos0
         self.data.qvel[:] = 0.0
         self.data.ctrl[:] = 0.0
 
@@ -463,6 +490,8 @@ class ControllerEvaluator:
         self.data.qpos[self.q_base_x] = rng.uniform(-config.init_base_pos_m, config.init_base_pos_m)
         self.data.qpos[self.q_base_y] = rng.uniform(-config.init_base_pos_m, config.init_base_pos_m)
 
+        if self.lock_root_attitude:
+            self._enforce_planar_root_attitude(do_forward=False)
         mujoco.mj_forward(self.model, self.data)
 
     def _build_measurement(
@@ -577,10 +606,48 @@ class ControllerEvaluator:
         gram_mpc = B_run.T @ q_mpc @ B_run + r_mpc
         rhs_mpc = B_run.T @ q_mpc @ A_run
         k_mpc = self._solve_linear_robust(gram_mpc, rhs_mpc, label="MPC one-step K")
+        mpc_controller = None
+        if mpc_family:
+            mpc_q_diag = np.array(
+                [
+                    runtime_cfg_for_episode.mpc_q_angles,
+                    runtime_cfg_for_episode.mpc_q_angles,
+                    runtime_cfg_for_episode.mpc_q_rates,
+                    runtime_cfg_for_episode.mpc_q_rates,
+                    1.0,
+                    runtime_cfg_for_episode.mpc_q_position,
+                    runtime_cfg_for_episode.mpc_q_position,
+                    runtime_cfg_for_episode.mpc_q_rates,
+                    runtime_cfg_for_episode.mpc_q_rates,
+                ],
+                dtype=float,
+            )
+            mpc_r_diag = np.array(
+                [
+                    runtime_cfg_for_episode.mpc_r_control,
+                    runtime_cfg_for_episode.mpc_r_control,
+                    runtime_cfg_for_episode.mpc_r_control,
+                ],
+                dtype=float,
+            )
+            mpc_controller = MPCController(
+                A=A_run,
+                B=B_run,
+                horizon=int(runtime_cfg_for_episode.mpc_horizon),
+                q_diag=mpc_q_diag,
+                r_diag=mpc_r_diag,
+                terminal_weight=float(runtime_cfg_for_episode.mpc_terminal_weight),
+                u_max=self.MAX_U.copy(),
+                com_radius_m=float(runtime_cfg_for_episode.mpc_com_constraint_radius_m),
+                angle_max_rad=float(runtime_cfg_for_episode.crash_angle_rad),
+                verbose=bool(runtime_cfg_for_episode.mpc_verbose),
+            )
         max_du = np.array([params.max_du_rw, params.max_du_bx, params.max_du_by], dtype=float)
         tilt_fail_rad = min(math.radians(config.max_worst_tilt_deg), self.CRASH_ANGLE_RAD)
 
         for step in range(1, config.steps + 1):
+            if self.lock_root_attitude:
+                self._enforce_planar_root_attitude()
             x_true = np.array(
                 [
                     self.data.qpos[self.q_pitch] - self.PITCH_EQ,
@@ -648,6 +715,30 @@ class ControllerEvaluator:
 
                 z = np.concatenate([x_ctrl, u_eff_applied])
                 du_lqr = -k_du @ z
+                u_target_mpc = None
+                if mpc_family:
+                    if mpc_controller is not None:
+                        x_ref_mpc = np.zeros_like(x_ctrl)
+                        rate_clip = float(max(runtime_cfg_for_episode.mpc_target_rate_clip_rad_s, 0.0))
+                        run_gain = float(max(runtime_cfg_for_episode.mpc_target_rate_gain, 0.0))
+                        term_gain = float(max(runtime_cfg_for_episode.mpc_terminal_rate_gain, 0.0))
+                        if rate_clip > 0.0:
+                            x_ref_mpc[2] = float(np.clip(-run_gain * x_ctrl[0], -rate_clip, rate_clip))
+                            x_ref_mpc[3] = float(np.clip(-run_gain * x_ctrl[1], -rate_clip, rate_clip))
+                        x_ref_terminal_mpc = x_ref_mpc.copy()
+                        if rate_clip > 0.0:
+                            x_ref_terminal_mpc[2] = float(np.clip(-term_gain * x_ctrl[0], -rate_clip, rate_clip))
+                            x_ref_terminal_mpc[3] = float(np.clip(-term_gain * x_ctrl[1], -rate_clip, rate_clip))
+                        u_mpc, mpc_info = mpc_controller.solve(
+                            x_ctrl,
+                            x_ref=x_ref_mpc,
+                            x_ref_terminal=x_ref_terminal_mpc,
+                        )
+                        if bool(mpc_info.get("success", False)):
+                            u_target_mpc = np.asarray(u_mpc, dtype=float)
+                    if u_target_mpc is None:
+                        # Keep deterministic fallback for rare infeasible/failed solves.
+                        u_target_mpc = np.asarray(-k_mpc @ x_ctrl, dtype=float)
 
                 rw_frac = abs(float(x_est[4])) / max(self.MAX_WHEEL_SPEED_RAD_S, 1e-6)
                 rw_damp_gain = 0.18 + 0.60 * max(0.0, rw_frac - 0.35)
@@ -674,8 +765,7 @@ class ControllerEvaluator:
                     u_rw_target = float(-(22.0 * x_est[0] + 6.0 * x_est[2]))
                     du_rw_cmd = float(u_rw_target - u_eff_applied[0])
                 elif mpc_family:
-                    u_target = -k_mpc @ x_ctrl
-                    du_rw_cmd = float(u_target[0] - u_eff_applied[0])
+                    du_rw_cmd = float(u_target_mpc[0] - u_eff_applied[0])
                 elif robust_hinf_family:
                     robust_term = float(
                         -0.40 * x_est[0]
@@ -813,9 +903,8 @@ class ControllerEvaluator:
                     base_target_x = 0.0
                     base_target_y = 0.0
                 if mpc_family:
-                    u_target = -k_mpc @ x_ctrl
-                    base_target_x = float(u_target[1])
-                    base_target_y = float(u_target[2])
+                    base_target_x = float(u_target_mpc[1])
+                    base_target_y = float(u_target_mpc[2])
                 if robust_hinf_family:
                     base_target_x += float(-0.12 * x_est[7] - 0.06 * x_est[5] - 0.06 * x_est[1])
                     base_target_y += float(-0.12 * x_est[8] - 0.06 * x_est[6] + 0.06 * x_est[0])
@@ -988,6 +1077,8 @@ class ControllerEvaluator:
                 self.data.xfrc_applied[self.stick_body_id, :3] = 0.0
 
             mujoco.mj_step(self.model, self.data)
+            if self.lock_root_attitude:
+                self._enforce_planar_root_attitude()
 
             pitch = float(self.data.qpos[self.q_pitch])
             roll = float(self.data.qpos[self.q_roll])

@@ -24,6 +24,7 @@ class RuntimeConfig:
     allow_base_motion_requested: bool
     real_hardware_base_unlocked: bool
     allow_base_motion: bool
+    lock_root_attitude: bool
     seed: int
     hardware_realistic: bool
     control_hz: float
@@ -123,7 +124,24 @@ class RuntimeConfig:
     mpc_q_rates: float
     mpc_q_position: float
     mpc_r_control: float
+    mpc_terminal_weight: float
+    mpc_target_rate_gain: float
+    mpc_terminal_rate_gain: float
+    mpc_target_rate_clip_rad_s: float
     mpc_com_constraint_radius_m: float
+    mpc_pitch_i_gain: float
+    mpc_pitch_i_clamp: float
+    mpc_pitch_i_deadband_rad: float
+    mpc_pitch_i_leak_per_s: float
+    mpc_pitch_guard_angle_frac: float
+    mpc_pitch_guard_rate_entry_rad_s: float
+    mpc_pitch_guard_kp: float
+    mpc_pitch_guard_kd: float
+    mpc_pitch_guard_max_frac: float
+    mpc_roll_i_gain: float
+    mpc_roll_i_clamp: float
+    mpc_roll_i_deadband_rad: float
+    mpc_roll_i_leak_per_s: float
     mpc_verbose: bool
 
 
@@ -239,6 +257,12 @@ def parse_args(argv=None):
         help="Allow base x/y actuation in --real-hardware mode (enabled by default).",
     )
     parser.add_argument(
+        "--lock-root-attitude",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clamp free-joint base attitude to upright (enabled by default).",
+    )
+    parser.add_argument(
         "--enable-base-integrator",
         action="store_true",
         help="Enable base x/y integral action. Disabled by default to avoid drift with unobserved base states.",
@@ -281,32 +305,134 @@ def parse_args(argv=None):
     parser.add_argument(
         "--mpc-horizon",
         type=int,
-        default=25,
-        help="MPC prediction horizon in steps (25 steps = 100ms at 250Hz).",
+        default=32,
+        help="MPC prediction horizon in steps (32 steps = 128ms at 250Hz).",
     )
     parser.add_argument(
         "--mpc-q-angles",
         type=float,
-        default=200.0,
+        default=280.0,
         help="MPC cost weight for pitch/roll angle errors.",
     )
     parser.add_argument(
         "--mpc-q-rates",
         type=float,
-        default=100.0,
+        default=180.0,
         help="MPC cost weight for pitch/roll rate errors.",
     )
     parser.add_argument(
         "--mpc-q-position",
         type=float,
-        default=50.0,
+        default=30.0,
         help="MPC cost weight for base position errors.",
     )
     parser.add_argument(
         "--mpc-r-control",
         type=float,
-        default=0.5,
+        default=0.25,
         help="MPC cost weight for control effort.",
+    )
+    parser.add_argument(
+        "--mpc-terminal-weight",
+        type=float,
+        default=8.0,
+        help="Multiplier on terminal state cost matrix (Qf = weight * Q).",
+    )
+    parser.add_argument(
+        "--mpc-target-rate-gain",
+        type=float,
+        default=4.0,
+        help="Shaped MPC rate target gain: rate_ref = -gain * angle.",
+    )
+    parser.add_argument(
+        "--mpc-terminal-rate-gain",
+        type=float,
+        default=7.0,
+        help="Terminal shaped rate target gain at horizon end.",
+    )
+    parser.add_argument(
+        "--mpc-target-rate-clip",
+        type=float,
+        default=4.0,
+        help="Clamp for shaped pitch/roll rate targets (rad/s).",
+    )
+    parser.add_argument(
+        "--mpc-pitch-i-gain",
+        type=float,
+        default=9.0,
+        help="MPC pitch anti-drift integral gain added to wheel command.",
+    )
+    parser.add_argument(
+        "--mpc-pitch-i-clamp",
+        type=float,
+        default=0.45,
+        help="Clamp for MPC pitch integral state (rad*s).",
+    )
+    parser.add_argument(
+        "--mpc-pitch-i-deadband-deg",
+        type=float,
+        default=0.15,
+        help="Pitch error deadband for MPC pitch integral action (deg).",
+    )
+    parser.add_argument(
+        "--mpc-pitch-i-leak-per-s",
+        type=float,
+        default=0.8,
+        help="Leak rate for MPC pitch integral state while inside deadband.",
+    )
+    parser.add_argument(
+        "--mpc-pitch-guard-angle-frac",
+        type=float,
+        default=0.45,
+        help="Pitch rescue starts at this fraction of crash angle.",
+    )
+    parser.add_argument(
+        "--mpc-pitch-guard-rate",
+        type=float,
+        default=1.2,
+        help="Pitch-rate threshold (rad/s) to trigger rescue when moving away from upright.",
+    )
+    parser.add_argument(
+        "--mpc-pitch-guard-kp",
+        type=float,
+        default=120.0,
+        help="Pitch rescue proportional gain on wheel command.",
+    )
+    parser.add_argument(
+        "--mpc-pitch-guard-kd",
+        type=float,
+        default=28.0,
+        help="Pitch rescue derivative gain on wheel command.",
+    )
+    parser.add_argument(
+        "--mpc-pitch-guard-max-frac",
+        type=float,
+        default=1.0,
+        help="Max wheel command fraction available to pitch rescue blend.",
+    )
+    parser.add_argument(
+        "--mpc-roll-i-gain",
+        type=float,
+        default=8.0,
+        help="MPC roll anti-drift integral gain added to roll actuator command.",
+    )
+    parser.add_argument(
+        "--mpc-roll-i-clamp",
+        type=float,
+        default=0.35,
+        help="Clamp for MPC roll integral state (rad*s).",
+    )
+    parser.add_argument(
+        "--mpc-roll-i-deadband-deg",
+        type=float,
+        default=0.12,
+        help="Roll error deadband for MPC roll integral action (deg).",
+    )
+    parser.add_argument(
+        "--mpc-roll-i-leak-per-s",
+        type=float,
+        default=0.8,
+        help="Leak rate for MPC roll integral state while inside deadband.",
     )
     parser.add_argument(
         "--mpc-verbose",
@@ -707,6 +833,7 @@ def build_config(args) -> RuntimeConfig:
         allow_base_motion_requested=allow_base_motion_requested,
         real_hardware_base_unlocked=real_hardware_base_unlocked,
         allow_base_motion=allow_base_motion,
+        lock_root_attitude=bool(getattr(args, "lock_root_attitude", True)),
         seed=int(args.seed),
         hardware_realistic=(not args.legacy_model) or real_hardware_profile,
         control_hz=control_hz,
@@ -801,11 +928,28 @@ def build_config(args) -> RuntimeConfig:
         wheel_only_max_du=wheel_only_max_du,
         wheel_only_int_clamp=0.35,
         use_mpc=bool(getattr(args, "use_mpc", False)),
-        mpc_horizon=int(max(getattr(args, "mpc_horizon", 25), 5)),
-        mpc_q_angles=float(max(getattr(args, "mpc_q_angles", 200.0), 1.0)),
-        mpc_q_rates=float(max(getattr(args, "mpc_q_rates", 100.0), 1.0)),
-        mpc_q_position=float(max(getattr(args, "mpc_q_position", 50.0), 1.0)),
-        mpc_r_control=float(max(getattr(args, "mpc_r_control", 0.5), 0.01)),
+        mpc_horizon=int(max(getattr(args, "mpc_horizon", 32), 5)),
+        mpc_q_angles=float(max(getattr(args, "mpc_q_angles", 280.0), 1.0)),
+        mpc_q_rates=float(max(getattr(args, "mpc_q_rates", 180.0), 1.0)),
+        mpc_q_position=float(max(getattr(args, "mpc_q_position", 30.0), 1.0)),
+        mpc_r_control=float(max(getattr(args, "mpc_r_control", 0.25), 0.01)),
+        mpc_terminal_weight=float(max(getattr(args, "mpc_terminal_weight", 8.0), 1.0)),
+        mpc_target_rate_gain=float(max(getattr(args, "mpc_target_rate_gain", 4.0), 0.0)),
+        mpc_terminal_rate_gain=float(max(getattr(args, "mpc_terminal_rate_gain", 7.0), 0.0)),
+        mpc_target_rate_clip_rad_s=float(max(getattr(args, "mpc_target_rate_clip", 4.0), 0.0)),
         mpc_com_constraint_radius_m=payload_support_radius_m,
+        mpc_pitch_i_gain=float(max(getattr(args, "mpc_pitch_i_gain", 9.0), 0.0)),
+        mpc_pitch_i_clamp=float(max(getattr(args, "mpc_pitch_i_clamp", 0.45), 0.0)),
+        mpc_pitch_i_deadband_rad=float(np.radians(max(getattr(args, "mpc_pitch_i_deadband_deg", 0.15), 0.0))),
+        mpc_pitch_i_leak_per_s=float(max(getattr(args, "mpc_pitch_i_leak_per_s", 0.8), 0.0)),
+        mpc_pitch_guard_angle_frac=float(np.clip(getattr(args, "mpc_pitch_guard_angle_frac", 0.45), 0.05, 0.98)),
+        mpc_pitch_guard_rate_entry_rad_s=float(max(getattr(args, "mpc_pitch_guard_rate", 1.2), 0.0)),
+        mpc_pitch_guard_kp=float(max(getattr(args, "mpc_pitch_guard_kp", 120.0), 0.0)),
+        mpc_pitch_guard_kd=float(max(getattr(args, "mpc_pitch_guard_kd", 28.0), 0.0)),
+        mpc_pitch_guard_max_frac=float(np.clip(getattr(args, "mpc_pitch_guard_max_frac", 1.0), 0.1, 1.5)),
+        mpc_roll_i_gain=float(max(getattr(args, "mpc_roll_i_gain", 8.0), 0.0)),
+        mpc_roll_i_clamp=float(max(getattr(args, "mpc_roll_i_clamp", 0.35), 0.0)),
+        mpc_roll_i_deadband_rad=float(np.radians(max(getattr(args, "mpc_roll_i_deadband_deg", 0.12), 0.0))),
+        mpc_roll_i_leak_per_s=float(max(getattr(args, "mpc_roll_i_leak_per_s", 0.8), 0.0)),
         mpc_verbose=bool(getattr(args, "mpc_verbose", False)),
     )

@@ -73,7 +73,14 @@
                specular="0 0 0"/>
 
         <!-- Flat ground plane -->
-        <geom name="ground" type="plane" size="100.0 100.0 0.1" pos="0 0 0" material="ground_mat" friction="6.0 0.01 0.0001"/>
+        <geom name="ground"
+              type="plane"
+              size="100.0 100.0 0.1"
+              pos="0 0 0"
+              material="ground_mat"
+              friction="6.0 0.01 0.0001"
+              solref="0.003 1"
+              solimp="0.995 0.999 0.0001 0.5 2"/>
 
         <!-- Safety catcher below terrain -->
         <!-- Invisible fail-safe floor to catch numerical blowups/falls. -->
@@ -96,12 +103,15 @@
 
                 <!-- Cart body -->
                 <!-- Main physical base-wheel/body geom for contact and inertia. -->
-                <geom type="cylinder"
+                <geom name="drive_wheel_phys"
+                      type="cylinder"
                       size="0.10 0.035"
                       mass="0.5"
                       quat="0.7071 0 0.7071 0"
                       material="base_mat"
-                      friction="6.0 0.01 0.0001"/>
+                      friction="6.0 0.01 0.0001"
+                      solref="0.003 1"
+                      solimp="0.995 0.999 0.0001 0.5 2"/>
                 <!-- Visual chassis shell (no mass/collision contribution). -->
                 <geom name="chassis_shell"
                       type="box"
@@ -218,7 +228,7 @@
                 <!-- Visual white sidewall bands on drive wheel. -->
                 <geom name="drive_sidewall_l"
                       type="cylinder"
-                      size="0.104 0.004"
+                      size="0.100 0.004"
                       pos="0.031 0 0"
                       quat="0.7071 0 0.7071 0"
                       mass="0"
@@ -227,7 +237,7 @@
                       material="battery_white_mat"/>
                 <geom name="drive_sidewall_r"
                       type="cylinder"
-                      size="0.104 0.004"
+                      size="0.100 0.004"
                       pos="-0.031 0 0"
                       quat="0.7071 0 0.7071 0"
                       mass="0"
@@ -440,6 +450,11 @@
         </body>
     </worldbody>
 
+    <contact>
+        <!-- Prevent self-collision between base wheel and stick link at nominal assembly pose. -->
+        <exclude body1="base_y" body2="stick"/>
+    </contact>
+
     <actuator>
         <!-- Motor command for wheel spin torque. -->
         <motor name="wheel_spin"
@@ -453,7 +468,7 @@
 
         <!-- Motor command for base Y force. -->
         <motor name="base_y_force"
-               joint="base_y_slide"
+               joint="stick_roll"
                ctrlrange="-100 100"/>
 
     </actuator>

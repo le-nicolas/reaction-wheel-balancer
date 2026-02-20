@@ -12,6 +12,7 @@ from runtime_model import (
     build_measurement_noise_cov,
     build_partial_measurement_matrix,
     compute_robot_com_distance_xy,
+    enforce_planar_root_attitude,
     enforce_wheel_only_constraints,
     estimator_measurement_update,
     get_true_state,
@@ -59,6 +60,40 @@ Run on your laptop/PC:
 """
 
 
+def _solve_discrete_are_robust(A: np.ndarray, B: np.ndarray, Q: np.ndarray, R: np.ndarray, label: str) -> np.ndarray:
+    reg_steps = (0.0, 1e-12, 1e-10, 1e-8, 1e-6)
+    eye = np.eye(R.shape[0], dtype=float)
+    last_exc: Exception | None = None
+    for eps in reg_steps:
+        try:
+            P = solve_discrete_are(A, B, Q, R + eps * eye)
+            if np.all(np.isfinite(P)):
+                return 0.5 * (P + P.T)
+        except Exception as exc:
+            last_exc = exc
+    raise RuntimeError(f"{label} DARE failed after regularization fallback: {last_exc}") from last_exc
+
+
+def _solve_linear_robust(gram: np.ndarray, rhs: np.ndarray, label: str) -> np.ndarray:
+    try:
+        return np.linalg.solve(gram, rhs)
+    except np.linalg.LinAlgError:
+        sol, *_ = np.linalg.lstsq(gram, rhs, rcond=None)
+        if not np.all(np.isfinite(sol)):
+            raise RuntimeError(f"{label} linear solve returned non-finite result.")
+        return sol
+
+
+def _controllability_rank(A: np.ndarray, B: np.ndarray) -> int:
+    n = A.shape[0]
+    ctrb = B.copy()
+    Ak = np.eye(n, dtype=float)
+    for _ in range(1, n):
+        Ak = Ak @ A
+        ctrb = np.hstack([ctrb, Ak @ B])
+    return int(np.linalg.matrix_rank(ctrb))
+
+
 def main():
     # 1) Parse CLI and build runtime tuning/safety profile.
     args = parse_args()
@@ -85,6 +120,8 @@ def main():
         "payload": ids.payload_body_id,
     }[args.push_body]
     reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
+    if cfg.lock_root_attitude:
+        enforce_planar_root_attitude(model, data, ids)
 
     # 3) Linearize XML-defined dynamics about upright and build controller gains.
     nx = 2 * model.nv + model.na
@@ -93,14 +130,15 @@ def main():
     B_full = np.zeros((nx, nu))
     mujoco.mjd_transitionFD(model, data, 1e-6, True, A_full, B_full, None, None)
 
+    # mjd_transitionFD uses tangent-space position coordinates (size nv), not qpos (size nq).
     idx = [
-        ids.q_pitch,
-        ids.q_roll,
+        ids.v_pitch,
+        ids.v_roll,
         model.nv + ids.v_pitch,
         model.nv + ids.v_roll,
         model.nv + ids.v_rw,
-        ids.q_base_x,
-        ids.q_base_y,
+        ids.v_base_x,
+        ids.v_base_y,
         model.nv + ids.v_base_x,
         model.nv + ids.v_base_y,
     ]
@@ -112,17 +150,28 @@ def main():
     A_aug = np.block([[A, B], [np.zeros((NU, NX)), np.eye(NU)]])
     B_aug = np.vstack([B, np.eye(NU)])
     Q_aug = np.block([[cfg.qx, np.zeros((NX, NU))], [np.zeros((NU, NX)), cfg.qu]])
-    P_aug = solve_discrete_are(A_aug, B_aug, Q_aug, cfg.r_du)
-    K_du = np.linalg.inv(B_aug.T @ P_aug @ B_aug + cfg.r_du) @ (B_aug.T @ P_aug @ A_aug)
-    A_w = A[np.ix_([0, 2, 4], [0, 2, 4])]
-    B_w = B[np.ix_([0, 2, 4], [0])]
-    Q_w = np.diag([260.0, 35.0, 0.6])
-    R_w = np.array([[0.08]])
-    P_w = solve_discrete_are(A_w, B_w, Q_w, R_w)
-    K_paper_pitch = np.linalg.inv(B_w.T @ P_w @ B_w + R_w) @ (B_w.T @ P_w @ A_w)
+    P_aug = _solve_discrete_are_robust(A_aug, B_aug, Q_aug, cfg.r_du, label="Controller")
+    K_du = _solve_linear_robust(B_aug.T @ P_aug @ B_aug + cfg.r_du, B_aug.T @ P_aug @ A_aug, label="Controller gain")
+    K_paper_pitch = None
     K_wheel_only = None
+    need_paper_pitch = cfg.wheel_only or (cfg.controller_family == "paper_split_baseline")
+    if need_paper_pitch:
+        A_w = A[np.ix_([0, 2, 4], [0, 2, 4])]
+        B_w = B[np.ix_([0, 2, 4], [0])]
+        Q_w = np.diag([260.0, 35.0, 0.6])
+        R_w = np.array([[0.08]])
+        try:
+            P_w = _solve_discrete_are_robust(A_w, B_w, Q_w, R_w, label="Paper pitch")
+            K_paper_pitch = _solve_linear_robust(B_w.T @ P_w @ B_w + R_w, B_w.T @ P_w @ A_w, label="Paper pitch gain")
+        except RuntimeError as exc:
+            print(f"Warning: paper pitch DARE unavailable, using analytic fallback. ({exc})")
+            K_paper_pitch = None
     if cfg.wheel_only:
-        K_wheel_only = K_paper_pitch.copy()
+        if K_paper_pitch is not None:
+            K_wheel_only = K_paper_pitch.copy()
+        else:
+            # Fallback: wheel-only branch already adds dedicated I and wheel-rate damping terms.
+            K_wheel_only = np.array([[cfg.wheel_only_pitch_kp, cfg.wheel_only_pitch_kd, 0.0]], dtype=float)
 
     # 4) Build estimator model from configured sensor channels/noise.
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
@@ -175,6 +224,7 @@ def main():
                 horizon=cfg.mpc_horizon,
                 q_diag=q_diag,
                 r_diag=r_diag,
+                terminal_weight=cfg.mpc_terminal_weight,
                 u_max=cfg.max_u,
                 com_radius_m=cfg.mpc_com_constraint_radius_m,
                 angle_max_rad=cfg.crash_angle_rad,
@@ -184,7 +234,35 @@ def main():
             print(f"Horizon: {cfg.mpc_horizon} steps ({cfg.mpc_horizon / cfg.control_hz * 1000:.1f} ms)")
             print(f"Q diagonal: angles={cfg.mpc_q_angles}, rates={cfg.mpc_q_rates}, pos={cfg.mpc_q_position}")
             print(f"R diagonal: control={cfg.mpc_r_control}")
+            print(f"Terminal weight: {cfg.mpc_terminal_weight:.2f}")
+            print(
+                "Target shaping: "
+                f"run_rate_gain={cfg.mpc_target_rate_gain:.2f} "
+                f"terminal_rate_gain={cfg.mpc_terminal_rate_gain:.2f} "
+                f"clip={cfg.mpc_target_rate_clip_rad_s:.2f}rad/s"
+            )
             print(f"COM constraint radius: {cfg.mpc_com_constraint_radius_m:.3f} m")
+            print(
+                "Pitch anti-drift I: "
+                f"gain={cfg.mpc_pitch_i_gain:.2f} "
+                f"clamp={cfg.mpc_pitch_i_clamp:.3f}rad*s "
+                f"deadband={np.degrees(cfg.mpc_pitch_i_deadband_rad):.3f}deg "
+                f"leak={cfg.mpc_pitch_i_leak_per_s:.2f}/s"
+            )
+            print(
+                "Pitch rescue guard: "
+                f"angle_frac={cfg.mpc_pitch_guard_angle_frac:.2f} "
+                f"rate={cfg.mpc_pitch_guard_rate_entry_rad_s:.2f}rad/s "
+                f"kp={cfg.mpc_pitch_guard_kp:.1f} kd={cfg.mpc_pitch_guard_kd:.1f} "
+                f"max_frac={cfg.mpc_pitch_guard_max_frac:.2f}"
+            )
+            print(
+                "Roll anti-drift I: "
+                f"gain={cfg.mpc_roll_i_gain:.2f} "
+                f"clamp={cfg.mpc_roll_i_clamp:.3f}rad*s "
+                f"deadband={np.degrees(cfg.mpc_roll_i_deadband_rad):.3f}deg "
+                f"leak={cfg.mpc_roll_i_leak_per_s:.2f}/s"
+            )
         except Exception as e:
             print(f"\nWarning: MPC initialization failed: {e}")
             print("Falling back to LQR control")
@@ -194,6 +272,10 @@ def main():
 
     print(f"A shape: {A.shape}, B shape: {B.shape}")
     print(f"A eigenvalues: {np.linalg.eigvals(A)}")
+    ctrb_rank = _controllability_rank(A, B)
+    print(f"Controllability rank: {ctrb_rank}/{A.shape[0]}")
+    if ctrb_rank < A.shape[0]:
+        print("Warning: model has uncontrollable modes (drift can remain despite tuning).")
     print("\n=== DELTA-U LQR ===")
     print(f"K_du shape: {K_du.shape}")
     print(f"controller_family={cfg.controller_family}")
@@ -210,6 +292,7 @@ def main():
     print(f"wheel_only={cfg.wheel_only}")
     print(f"allow_base_motion={cfg.allow_base_motion}")
     print(f"wheel_only_forced={cfg.wheel_only_forced}")
+    print(f"lock_root_attitude={cfg.lock_root_attitude}")
     print(f"seed={cfg.seed}")
     print(
         f"hardware_realistic={cfg.hardware_realistic} control_hz={cfg.control_hz:.1f} "
@@ -328,6 +411,8 @@ def main():
         print(f"REAL-HARDWARE profile active: strict bring-up limits + forced stop_on_crash + base motion {base_msg}.")
 
     reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
+    if cfg.lock_root_attitude:
+        enforce_planar_root_attitude(model, data, ids)
     upright_blend = 0.0
     despin_gain = 0.25
     rng = np.random.default_rng(cfg.seed)
@@ -482,7 +567,10 @@ def main():
                 data.xfrc_applied[push_body_id, :3] -= prev_script_force
                 prev_script_force[:] = 0.0
             if cfg.wheel_only:
-                enforce_wheel_only_constraints(model, data, ids)
+                enforce_wheel_only_constraints(model, data, ids, lock_root_attitude=cfg.lock_root_attitude)
+            else:
+                if cfg.lock_root_attitude:
+                    enforce_planar_root_attitude(model, data, ids)
 
             x_true = get_true_state(data, ids)
             com_planar_dist = compute_robot_com_distance_xy(model, data, ids.base_y_body_id)
@@ -491,6 +579,8 @@ def main():
             if not np.all(np.isfinite(x_true)):
                 print(f"\nNumerical instability at step {step_count}; resetting state.")
                 reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
+                if cfg.lock_root_attitude:
+                    enforce_planar_root_attitude(model, data, ids)
                 com_fail_streak = 0
                 (
                     x_est,
@@ -709,7 +799,10 @@ def main():
 
             mujoco.mj_step(model, data)
             if cfg.wheel_only:
-                enforce_wheel_only_constraints(model, data, ids)
+                enforce_wheel_only_constraints(model, data, ids, lock_root_attitude=cfg.lock_root_attitude)
+            else:
+                if cfg.lock_root_attitude:
+                    enforce_planar_root_attitude(model, data, ids)
             wheel_speed_after = float(data.qvel[ids.v_rw])
             wheel_speed_abs_after = abs(wheel_speed_after)
             wheel_speed_abs_sum += wheel_speed_abs_after
@@ -757,7 +850,9 @@ def main():
                     f"com_xy={com_planar_dist:6.3f}m"
                 )
 
-            tilt_failed = abs(pitch) >= cfg.crash_angle_rad or abs(roll) >= cfg.crash_angle_rad
+            pitch_failed = abs(pitch) >= cfg.crash_angle_rad
+            roll_failed = abs(roll) >= cfg.crash_angle_rad
+            tilt_failed = pitch_failed or roll_failed
             com_failed = com_fail_streak >= cfg.payload_com_fail_steps
             if tilt_failed or com_failed:
                 crash_count += 1
@@ -794,11 +889,14 @@ def main():
                 print(
                     f"\nCRASH #{crash_count} at step {step_count}: "
                     f"pitch={np.degrees(pitch):.2f}deg roll={np.degrees(roll):.2f}deg "
-                    f"com_xy={com_planar_dist:.3f}m reason={'com_overload' if com_failed else 'tilt'}"
+                    f"com_xy={com_planar_dist:.3f}m "
+                    f"reason={'com_overload' if com_failed else ('pitch_tilt' if pitch_failed else 'roll_tilt')}"
                 )
                 if cfg.stop_on_crash:
                     break
                 reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
+                if cfg.lock_root_attitude:
+                    enforce_planar_root_attitude(model, data, ids)
                 com_fail_streak = 0
                 (
                     x_est,

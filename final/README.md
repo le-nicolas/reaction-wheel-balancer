@@ -1,485 +1,279 @@
-# Final Folder Guide (For Non-Technical Readers)
+# Final Balancer: Build Story, Problems, and Reproducible Guide
 
-good for modeling and deriving firmware parameters, but treat it as pre-deployment logic, not final safety-certified hardware control.
+This folder is the current MuJoCo implementation of our wheel-on-stick balancer.
+The goal of this README is to explain:
 
-This folder is the "main demo" of the project.
+1. What `final.py` and `final.xml` do.
+2. How we evolved the design.
+3. What failed along the way and how we fixed it.
+4. How to reproduce the work and rebuild the system from scratch.
 
-It simulates a self-balancing robot in MuJoCo and shows how software can keep a robot upright using a reaction wheel and a moving base.
+## 1) What Is In This Folder
 
-## Scope and Claim Boundaries
+| File | Purpose |
+|---|---|
+| `final/final.xml` | Mechanical and physics model (bodies, joints, inertia, contacts, actuators). |
+| `final/final.py` | Runtime loop: parse config, linearize model, estimate state, compute control, apply safety, simulate/render. |
+| `final/control_core.py` | Main control law and safety shaping (LQR path and MPC path). |
+| `final/runtime_config.py` | All runtime parameters and CLI flags. |
+| `final/runtime_model.py` | Model IDs, reset logic, estimator, COM distance checks, root-attitude clamp helpers. |
+| `final/mpc_controller.py` | Constrained MPC solver (OSQP/scipy fallback). |
+| `final/controller_eval.py` | Headless evaluator used by benchmarking/tuning scripts. |
+| `final/benchmark.py` | Reproducible stress benchmark and artifact writer. |
 
-- This folder reports simulation results only, under the exact benchmark settings and artifacts in `final/results/`.
-- It does not claim certified hardware safety, formal stability guarantees, or universal superiority over prior physical robots.
-- Literature comparisons are for context and reproducibility, not direct apples-to-apples hardware claims.
+## 2) How `final.xml` and `final.py` Fit Together
 
-## Implemented Architecture (Current)
+`final.xml` is the source of truth for robot physics.
+`final.py` reads it and builds a controller around that exact model.
 
-- State estimation: linear Kalman correction from noisy IMU/encoder-like channels.
-- Control core: delta-u LQR with runtime safety shaping and mode-specific terms.
-- Optional residual correction: offline-trained PyTorch model adds bounded `delta_u` on top of nominal control (`u = u_nominal + delta_u`), with runtime tilt/rate gating.
-- Safety policies: wheel-speed budget/high-spin latch, strict hard-speed same-direction suppression, base-authority gating, actuator clipping/rate limits, crash-angle stop logic.
+Control state used in runtime:
 
-## Not Implemented (Do Not Infer)
+`x = [pitch, roll, pitch_rate, roll_rate, wheel_rate, base_x, base_y, base_vx, base_vy]`
 
-- Disturbance-observer-based control law (DOB) with explicit online disturbance compensation.
-- Control-Lyapunov-function QP controller (CLF-QP), including closed-form CLF-QP update rules.
-- Formal Lyapunov proof for the full runtime controller.
+Control command:
 
-## Metrics Snapshot (2026-02-16)
+`u = [wheel_spin, base_x_force, base_y_force]`
 
-Canonical source:
-- `final/results/benchmark_20260216_011044_summary.txt`
-- `final/results/benchmark_20260216_011044.csv`
-- `final/results/benchmark_20260216_011044_protocol.json`
+Runtime flow in `final/final.py`:
 
-| Controller (mode_default / nominal / default) | Survival | Crash rate | Composite score |
-|---|---:|---:|---:|
-| `baseline_robust_hinf_like` | 1.000 | 0.000 | 75.457 |
-| `hybrid_modern` | 1.000 | 0.000 | 74.460 |
-| `current` | 1.000 | 0.000 | 73.993 |
-| `paper_split_baseline` | 1.000 | 0.000 | 72.913 |
-| `baseline_mpc` | 0.625 | 0.375 | 37.837 |
+1. Parse CLI and build `RuntimeConfig`.
+2. Load `final.xml` and resolve IDs by name.
+3. Linearize dynamics around upright (`mjd_transitionFD`).
+4. Build controller gains (LQR delta-u, optional MPC setup).
+5. Build estimator (Kalman correction on noisy channels).
+6. Run loop: estimate -> control -> clamp/derate/safety -> step MuJoCo -> detect crash.
+7. Log metrics/artifacts.
 
-## Reproducibility
+## 2.1) Architecture Diagram
 
-Benchmark command used for this snapshot:
+```text
+                    +-----------------------------+
+                    |      runtime_config.py      |
+                    |  CLI flags -> RuntimeConfig |
+                    +-------------+---------------+
+                                  |
+                                  v
+                    +-----------------------------+
+                    |          final.py           |
+                    | orchestrates runtime loop   |
+                    +------+------+---------------+
+                           |      |
+             load model    |      | control call
+                           |      v
+                           |   +---------------------------+
+                           |   |      control_core.py      |
+                           |   | LQR/MPC + safety shaping  |
+                           |   +------+--------------------+
+                           |          |
+                           |          | (if --use-mpc)
+                           |          v
+                           |   +---------------------------+
+                           |   |     mpc_controller.py     |
+                           |   | constrained QP optimizer  |
+                           |   +---------------------------+
+                           |
+                           v
+              +-----------------------------+
+              |         final.xml           |
+              | plant: joints/acts/contact  |
+              +--------------+--------------+
+                             |
+                             v
+              +-----------------------------+
+              |      runtime_model.py       |
+              | IDs, reset, estimator, COM  |
+              +--------------+--------------+
+                             |
+                             v
+              +-----------------------------+
+              | MuJoCo step + state update  |
+              +--------------+--------------+
+                             |
+                             v
+              +-----------------------------+
+              | logs/metrics/results output  |
+              +-----------------------------+
 
-```bash
-python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
+Benchmark path (headless):
+benchmark.py -> controller_eval.py -> same plant/control stack -> final/results/*
 ```
 
-Expected outputs:
-- `final/results/benchmark_<timestamp>_summary.txt`
-- `final/results/benchmark_<timestamp>.csv`
-- `final/results/benchmark_<timestamp>_protocol.json`
+## 3) How We Got To The Current Design
 
-## 1) What This Is
+This is the practical progression we followed.
 
-In simple terms, this robot is like a broom trying to stand upright on your hand:
-- the **stick** wants to fall,
-- the **reaction wheel** inside can twist the body back,
-- the **base** can slide to catch the fall,
-- the controller repeats this many times per second.
+1. Mechanical model first.
+Implemented the free-body base, 2-DOF stick (`stick_pitch`, `stick_roll`), reaction wheel joint (`wheel_spin`), terrain, and motor actuators in `final/final.xml`.
 
-Key files:
-- Simulation + controller: `final/final.py`
-- Mechanical model (geometry, joints, actuators): `final/final.xml`
-- ESP32 firmware notes: `final/firmware/README.md`
+2. Baseline controller around linearized dynamics.
+Added finite-difference linearization + delta-u LQR in `final/final.py` and `final/control_core.py`.
 
-## 2) Mechanical Design (Why the Geometry Helps It Balance)
+3. Estimation and hardware-like runtime behavior.
+Added IMU/encoder noise, control delay, quantization, and Kalman update in `final/runtime_model.py`.
 
-### Main parts
-- **Base body / wheel area**: lower body that contacts terrain.
-- **Base X/Y slide joints**: lets the base shift under the robot.
-- **Stick body**: upright mass that must be stabilized.
-- **Reaction wheel**: spinning rotor that creates corrective torque.
+4. Runtime safety layers.
+Added saturation handling, wheel momentum budget/hard-zone behavior, command-rate limits, and crash detection in `final/control_core.py` and `final/final.py`.
 
-### Why this geometry works
-- The stick has mass above the base, so gravity creates a tipping moment.
-- The reaction wheel can create fast opposite torque without moving the whole base first.
-- If wheel speed gets too high, the base can move to reduce required wheel momentum.
-- That gives two balancing tools:
-  1. rotational correction (reaction wheel),
-  2. translational correction (base motion).
+5. Reproducible evaluation.
+Added `final/controller_eval.py` and `final/benchmark.py` for deterministic multi-episode testing and artifact generation in `final/results/`.
 
-### Geometry types in the XML
-- **Dynamics-critical geometry**: affects mass/inertia/contact.
-- **Visual-only geometry**: for appearance only (`mass="0"`, no collision contribution).
+6. MPC path with hard constraints.
+Added `final/mpc_controller.py` and integration into `final/final.py`/`final/control_core.py` for constrained control (input/angle/COM bounds).
 
-This separation is intentional: you can improve look/shape without silently breaking control physics.
+7. Drift and tilt hardening.
+Added root attitude clamping, robust DARE fallbacks, terminal cost/rate-target shaping, pitch/roll anti-drift integrators, and pitch rescue logic.
 
-## 3) Physics in Plain English (with Light Math)
+## 4) Problems We Hit and How We Solved Them
 
-These are the key ideas behind balancing:
+| Problem observed | Root cause | Fix applied | Where |
+|---|---|---|---|
+| `solve_discrete_are` failures (`ill-conditioned`, `no finite solution`) | Numerical sensitivity in some linearized/augmented cases | Added robust DARE wrapper with regularization sweep and robust linear solve fallback | `final/final.py`, `final/controller_eval.py` |
+| Robot kept falling sideways | Roll control channel was effectively wrong for this architecture | Remapped `base_y_force` to `stick_roll` to restore direct roll authority | `final/final.xml` |
+| Stick looked like it tilted while base orientation drifted unrealistically | Uncontrolled free-joint attitude mode | Added `lock_root_attitude` path to clamp free-joint quaternion/angular rates upright | `final/runtime_model.py`, `final/final.py`, `final/controller_eval.py`, `final/runtime_config.py` |
+| Wheel looked visually detached from ground | Visual-only geometry dimensions did not match physical contact cylinder | Made physical contact geometry explicit (`drive_wheel_phys`) and aligned visual sidewall radius | `final/final.xml` |
+| Occasional self-collision artifacts | Base and stick could collide at nominal assembly | Added contact exclusion between `base_y` and `stick` | `final/final.xml` |
+| MPC solve failures caused unstable behavior | Optimizer can fail/infeasible on some steps | Added runtime fallback to clipped one-step linear feedback | `final/control_core.py` |
+| MPC was stable but could drift into persistent backward pitch mode | Slow model mismatch and insufficient late-stage recovery | Added terminal/reference shaping, pitch I-term, pitch rescue guard, and base-x pitch support blending | `final/runtime_config.py`, `final/mpc_controller.py`, `final/control_core.py`, `final/final.py` |
+| Crash logs were hard to interpret | Failures were grouped as generic tilt | Added explicit `pitch_tilt` vs `roll_tilt` vs `com_overload` reason logging | `final/final.py` |
 
-- Torque drives angular acceleration:
-  - `tau = I * alpha`
-- Angular momentum of wheel:
-  - `L = I_w * omega_w`
-- Equal/opposite torque effect:
-  - accelerating wheel one way pushes body the other way.
+## 4.1) Troubleshooting Matrix
 
-For small tilt angles, an inverted pendulum can be approximated as:
-- `theta_ddot ≈ (g/l) * theta + (tau_control / I_body)`
+Use this matrix when behavior regresses or a run "looks wrong".
 
-Where:
-- `theta` = tilt angle,
-- `g` = gravity,
-- `l` = center-of-mass height,
-- `tau_control` = motor-generated correction torque.
+| Symptom | Quick checks | Likely cause | Action |
+|---|---|---|---|
+| Falls backward repeatedly (pitch) | Inspect runtime logs for rising `pitch` with near-zero `roll` | Pitch drift accumulation or weak late recovery | Increase pitch hardening: `--mpc-pitch-i-gain`, `--mpc-pitch-i-clamp`, `--mpc-pitch-guard-kp`, `--mpc-pitch-guard-kd`, lower `--mpc-pitch-guard-angle-frac` |
+| Tilts sideways (roll) | Confirm crash reason is `roll_tilt` and check `u_by` activity | Roll authority/sign mismatch | Verify actuator wiring in XML (`base_y_force` mapping), tune roll gains/limits, confirm `--allow-base-motion` is enabled |
+| Stick tilts but whole robot pose looks wrong | Check if free-joint attitude drifts in long runs | Uncontrolled root attitude mode | Keep `--lock-root-attitude` enabled (default) |
+| Wheel appears not touching ground visually | Compare physical wheel radius and visual sidewall radius | Visual geometry mismatch | Align visual geoms to physical contact geom in `final/final.xml` (`drive_wheel_phys`, sidewall sizes) |
+| `solve_discrete_are` throws ill-conditioned/no-finite-solution errors | Confirm where failure happens (`Controller` vs `Paper pitch`) | Numerical conditioning near marginal modes | Use robust DARE path (already default), avoid forcing fragile controller family until model/regime is valid |
+| MPC "fails" intermittently or acts like commands drop | Check whether fallback path is active | QP solve/infeasibility on some steps | Keep runtime fallback enabled (default), tune horizon/costs and constraints (`--mpc-horizon`, `--mpc-q-*`, `--mpc-r-control`) |
+| High crash count only in long runs | Compare short-run vs long-run metrics | Slow drift reaching hard limits | Use long headless benchmark, analyze trace terms, prioritize drift compensation over short-run smoothness |
+| COM overload crashes | Check `com_xy` vs payload support radius in logs | COM boundary exceeded under load/drift | Tune base support behavior, reduce payload or increase support radius (`--payload-support-radius-m`) for experiments |
+| Base commands saturate at limits | Monitor `u_bx`, `u_by` and sat metrics | Gains too aggressive or actuator limits too tight | Reduce aggressive gains or increase penalties (`--mpc-r-control`), re-tune `max_u`/`max_du` profiles carefully |
+| Viewer looks stable but benchmark fails | Compare same mode/flags between viewer and headless run | Configuration mismatch | Re-run benchmark with explicit flags and fixed seed, then replay with same config in viewer |
 
-Terrain friction matters too: if contact is poor, base motion helps less.
+## 5) Reproduce The Current System
 
-## 3.5)  System Dynamics & State-Space Model
+### 5.1 Environment Setup
 
-This is the **linearized reaction wheel balancer system** around the upright equilibrium. It's the mathematical abstraction of the robot's physics that the controller must stabilize.
-
-### Physical Components
-
-- **Reaction wheel**: A motor-driven spinning wheel that applies corrective torque to the tilt angles
-- **Inverted pendulum (stick)**: The main body that wants to fall; must stay upright
-- **Wheeled base (X/Y platform)**: A 2D translating platform that shifts to help balance
-
-### State Vector (9-Dimensional)
-
-The state is:
-```
-x = [pitch,            # Tilt forward/backward (radians)
-     roll,             # Tilt side-to-side (radians)
-     pitch_rate,       # Forward tilt velocity (rad/s)
-     roll_rate,        # Side tilt velocity (rad/s)
-     wheel_rate,       # Reaction wheel speed (rad/s)
-     base_x,           # Platform position X (meters)
-     base_y,           # Platform position Y (meters)
-     base_vel_x,       # Platform velocity X (m/s)
-     base_vel_y]       # Platform velocity Y (m/s)
-```
-
-### Control Inputs (3-Dimensional)
-
-```
-u = [wheel_torque,     # Reaction wheel torque (Nm, ±80 limit)
-     base_x_force,     # Platform X force (N, ±10 limit)
-     base_y_force]     # Platform Y force (N, ±10 limit)
-```
-
-### Linearized Dynamics
-
-Then it is governed by discrete-time linear dynamics:
-```
-x_{k+1} = A · x_k + B · u_k
-```
-
-where:
-- **A** is the 9×9 state transition matrix (from finite-difference linearization around equilibrium)
-- **B** is the 9×3 control input matrix
-
-### The Problem: Marginally Stable Poles
-
-The eigenvalues of A are:
-```
-λ = [1.0, 1.0, 0.968, 0.786, 0.817, 0.946, 1.008, 0.999, 0.988]
-     ↑↑
-   **Two poles exactly at λ=1.0 (marginally stable)**
-```
-
-These integrator poles mean:
-- The system does **not naturally decay** to equilibrium on its own
-- Even perfect measurements and infinite precision cannot prevent eventual drift
-- Sensor noise, discretization errors, and model mismatch cause permanent divergence
-- The COM (center of mass) periodically exceeds the 0.145m support radius, triggering crashes
-
-**Result**: ~1,300–1,600 crashes per 5–6 million simulated steps at 1 kHz, regardless of whether using LQR or MPC.
-
-### Control Constraints
-
-The controller must respect:
-- **COM boundary**: sqrt(base_x² + base_y²) ≤ 0.145 m (hard limit for support)
-- **Angle limits**: |pitch|, |roll| ≤ 0.436 rad (~25°) before crash detection
-- **Input saturation**: |u| ≤ [80, 10, 10] Nm/N
-- **Receding horizon**: Only 100 ms (25 control steps) of prediction
-
-### Why This Matters for Control Design
-
-1. **LQR alone is insufficient**: Standard feedback gain cannot overcome integrator poles and fundamental drift
-2. **MPC with hard constraints**: Embeds the COM boundary directly in the optimization to preemptively stay safe, rather than reacting after the fact
-3. **Fundamental limits**: No single control law can eliminate all crashes; the system reaches its physical limits with the given support radius
-
-This is why the MPC implementation focuses on **constraint satisfaction** rather than just error minimization.
-
-## 4) Control Law (How Software Actually Stabilizes It)
-
-Every control update in `final/final.py` does:
-1. Measure noisy sensor channels (IMU/encoder-like signals).
-2. Estimate current state (Kalman correction).
-3. Compute command increment using delta-u LQR.
-4. Optionally add residual correction from an offline PyTorch model.
-5. Apply saturation/rate limits and safety logic.
-6. Send commands to MuJoCo actuators.
-
-Core control form:
-- `du = -K * [x; u_prev]`
-- `u = clip(u_prev + du)`
-
-This means it does not jump directly to giant commands; it adjusts smoothly while respecting limits.
-
-Residual correction behavior (optional):
-- It does not replace the controller.
-- It is offline-trained only (no online learning in runtime loop).
-- It is clipped and gated by tilt/rate thresholds.
-- If `delta_u = 0`, behavior falls back to the original controller path.
-
-Safety layers include:
-- wheel speed budget and high-spin recovery latch,
-- strict hard-zone protection that suppresses same-direction wheel torque near hard speed,
-- base authority gating,
-- actuator slew/torque limits,
-- crash-angle stop logic.
-
-## 5) Realism Assumptions in Simulation
-
-The simulation intentionally includes real-world effects:
-- control loop rate separate from physics timestep,
-- command delay queue,
-- IMU/wheel/base sensor noise,
-- motor envelope and saturation limits,
-- crash thresholds and stop-on-crash behavior.
-
-So the controller is not tuned on a perfect/noiseless world.
-
-## 6) ESP32 Relevance
-
-This project is structured so simulation logic maps to embedded firmware flow:
-- fixed-rate estimator/controller loop,
-- actuator guardrails,
-- deterministic exported parameters.
-
-Important files:
-- `final/export_firmware_params.py` (exports controller params)
-- `final/test_export_parity.py` (checks export/runtime consistency)
-- `final/firmware/README.md` (integration notes for embedded side)
-
-For ESP32 bring-up, the same safety mindset is used: bounded commands, watchdog-like checks, and conservative modes.
-
-## 7) Run It on Your Laptop / PC
-
-Requirements:
-- Python 3.10+
-- GPU/display environment for MuJoCo viewer
-
-Install:
-
-```bash
+```powershell
+cd C:\Users\User\Mujoco-series
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+pip install osqp matplotlib pytest
 ```
 
-Optional residual dependency:
+Optional:
 
-```bash
-pip install torch
-```
+1. `pip install torch` if you want residual model support.
 
-Run default smooth mode:
+### 5.2 Run Interactive Viewer
 
-```bash
+```powershell
 python final/final.py --mode smooth
+python final/final.py --mode robust
+python final/final.py --use-mpc --mode robust
 ```
 
-Run with top payload mass:
+### 5.3 Run Reproducible Benchmark (Headless)
 
-```bash
-python final/final.py --mode smooth --payload-mass 0.8
+```powershell
+python final/benchmark.py --benchmark-profile fast_pr --episodes 12 --steps 6000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
 ```
 
-Run robust profile:
+Outputs are written to `final/results/`:
 
-```bash
-python final/final.py --mode robust --stability-profile low-spin-robust
+1. `benchmark_<timestamp>.csv`
+2. `benchmark_<timestamp>_summary.txt`
+3. `benchmark_<timestamp>_protocol.json`
+4. `benchmark_<timestamp>_release_bundle.json`
+
+### 5.4 Capture Detailed Runtime Logs
+
+```powershell
+python final/final.py --use-mpc --mode robust --log-control-terms --control-terms-csv final/results/control_terms_debug.csv --trace-events-csv final/results/runtime_trace_debug.csv
 ```
 
-Run controller families:
+## 6) Rebuild From Scratch (Recommended Path)
 
-```bash
-python final/final.py --mode smooth --controller-family current
-python final/final.py --mode smooth --controller-family hybrid_modern
-python final/final.py --mode smooth --controller-family paper_split_baseline
+If someone wants to recreate this project from zero, use this exact sequence.
+
+1. Build a minimal MuJoCo plant in XML.
+Include a ground plane, base free-joint, stick pitch/roll joints, reaction wheel joint, and three actuators.
+Success check: model loads and steps without NaNs.
+
+2. Implement runtime skeleton.
+Load model, resolve names, read true state, apply raw controls.
+Success check: actuator commands match expected joints/signs.
+
+3. Add linearization and baseline LQR.
+Linearize around upright, build delta-u controller, clip commands.
+Success check: recovers from small initial tilt.
+
+4. Add estimator and hardware realism.
+Inject sensor noise + control delay + quantization, then Kalman correction.
+Success check: no unstable drift from estimator mismatch alone.
+
+5. Add safety envelopes.
+Wheel speed budget/hard zone, actuator derates, COM support checks, crash logic.
+Success check: no runaway command/wheel behavior.
+
+6. Add evaluation harness.
+Run many seeds/episodes headlessly and persist artifacts for comparison.
+Success check: benchmark outputs are deterministic and comparable across changes.
+
+7. Add MPC and harden difficult modes.
+Use constrained MPC with runtime fallback, then add targeted anti-drift logic for observed failure modes.
+Success check: better crash behavior under stress tests, not just easier nominal runs.
+
+## 7) Practical Tuning Workflow (Pitch-First)
+
+When pitch is your dominant failure mode, tune in this order:
+
+1. Verify model/control wiring first.
+Confirm `wheel_spin`, `base_x_force`, `base_y_force` map to intended joints.
+
+2. Stabilize optimization behavior.
+Tune `--mpc-horizon`, `--mpc-q-angles`, `--mpc-q-rates`, `--mpc-r-control`, `--mpc-terminal-weight`.
+
+3. Shape pitch transients.
+Tune `--mpc-target-rate-gain`, `--mpc-terminal-rate-gain`, `--mpc-target-rate-clip`.
+
+4. Compensate slow drift.
+Tune `--mpc-pitch-i-gain`, `--mpc-pitch-i-clamp`, `--mpc-pitch-i-deadband-deg`, `--mpc-pitch-i-leak-per-s`.
+
+5. Add emergency behavior.
+Tune `--mpc-pitch-guard-angle-frac`, `--mpc-pitch-guard-rate`, `--mpc-pitch-guard-kp`, `--mpc-pitch-guard-kd`.
+
+6. Validate with both nominal and stressed runs.
+Use scripted pushes and benchmark seeds, not only one clean viewer run.
+
+## 8) Important Boundaries
+
+1. This is simulation-first engineering work, not a hardware safety certification.
+2. Some long-horizon drift behavior can be plant-limited with the current geometry/actuation.
+3. Benchmark conclusions are valid for the tested settings and artifacts in `final/results/`.
+4. Viewer behavior and headless benchmark behavior should be compared, not assumed identical without checking logs.
+
+## 9) Useful Commands
+
+```powershell
+# Show all runtime flags
+python final/final.py --help
+
+# MPC robust run
+python final/final.py --use-mpc --mode robust
+
+# Quick baseline benchmark
+python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 --trials 0
+
+# Export firmware-friendly controller header
+python final/export_firmware_params.py --mode robust --out final/firmware/controller_params.h
 ```
-
-Try push disturbance:
-
-```bash
-python final/final.py --mode smooth --push-x 4 --push-start-s 1.0 --push-duration-s 0.15
-```
-
-Try hardware-like constraints:
-
-```bash
-python final/final.py --mode robust --real-hardware
-```
-
-Run with optional residual correction:
-
-```bash
-python final/final.py --mode smooth --residual-model path/to/residual.pt --residual-scale 0.20
-```
-
-## 8) Implemented Runtime Features
-
-- It uses a hybrid architecture: model-based core with explicit safety shaping.
-- It includes a literature-style comparator (`paper_split_baseline`) for fair evaluation.
-- It supports interpretable term logging (`--log-control-terms`) so each command can be traced to named terms.
-- It now logs wheel-spin telemetry for tuning: signed peak speed, mean absolute speed, over-budget/over-hard ratios (total and sign-split), and hard-zone suppression counters.
-
-## 9) Recent Update (February 2026)
-
-- Added runtime controller family selector:
-  - `--controller-family {current,hybrid_modern,paper_split_baseline}`
-- Added explainability logging for control terms with optional CSV output:
-  - `--log-control-terms`
-  - `--control-terms-csv <path>`
-- Added benchmark coverage for modern, literature-style, and legacy controller families.
-- Added composite-score + hard-gate + significance-based promotion logic.
-- Added benchmark profiles for operations:
-  - `fast_pr` for quick deterministic checks
-  - `nightly_long` for full stress validation
-
-## 10) Benchmark Protocol
-
-- Run with `final/benchmark.py`.
-- Default benchmark compares multiple controller families and operating modes.
-- Uses:
-  - hard stability/saturation gates,
-  - composite score,
-  - paired bootstrap significance for promotion decisions.
-
-Fast PR profile:
-
-```bash
-python final/benchmark.py --benchmark-profile fast_pr
-```
-
-Nightly long profile:
-
-```bash
-python final/benchmark.py --benchmark-profile nightly_long
-```
-
-Release campaign:
-
-```bash
-python final/benchmark.py --release-campaign --multiple-comparison-correction holm
-```
-
-Strict simulation hardware-readiness gate:
-
-```bash
-python final/benchmark.py --release-campaign --readiness-report --readiness-sign-window-steps 25 --readiness-replay-min-consistency 0.60 --readiness-replay-max-nrmse 0.75
-```
-
-Optional hardware replay:
-
-```bash
-python final/benchmark.py --benchmark-profile nightly_long --hardware-trace-path path/to/hardware_trace.csv
-python final/final.py --mode smooth --trace-events-csv final/results/runtime_trace.csv
-```
-
-Readiness outputs:
-- `final/results/readiness_<timestamp>.json`
-- `final/results/readiness_<timestamp>.md`
-
-## 11) Historical Paper Comparison (Nuanced)
-
-### Intention of this comparison
-
-- The intent is to show **simulation-only advancement** through reproducibility, stress testing, and transparent benchmark artifacts.
-- The intent is **not** to dismiss physical robot work; fabrication tolerances, sensor drift, and integration constraints are real and matter.
-- Therefore, we compare with nuance: stronger simulation evaluation does not automatically mean universally better real-world control.
-
-### Reference paper (physical robot, about a decade earlier)
-
-- Source paper:
-  - J. Lee, S. Han, J. Lee, "Decoupled Dynamic Control for Pitch and Roll Axes of the Unicycle Robot," IEEE TIE, Vol. 60, No. 9, September 2013, DOI: `10.1109/TIE.2012.2208431`.
-- Local file used for review:
-  - `C:/Users/User/Downloads/onebot.pdf`
-- Extracted text artifact used in this repo:
-  - `final/results/onebot_extracted.txt`
-
-Paper-reported findings (hardware experiments):
-- Decoupled control architecture:
-  - roll: fuzzy-sliding mode
-  - pitch: LQR
-- Trajectory tests:
-  - ramp input over `3.3 m`
-  - ladder input over `1.1 m` forward/back
-  - parabolic input up to `2.8 m`
-- Reported angle error ranges:
-  - ramp: roll about `+/-1 deg`, pitch about `+/-2 deg`
-  - ladder: roll about `+/-2 deg`, pitch about `+/-4 deg`
-  - parabolic: mostly around `+/-1 deg` (roll), `+/-2 deg` (pitch), with temporary pitch increase above `4 deg` around `30 s`
-- Reported limitation: velocity remained below `0.1 m/s` due sensor speed limits.
-
-### This repo findings (simulation campaign)
-
-As of the benchmark run on `2026-02-16`:
-- Command:
-  - `python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced`
-- Artifacts:
-  - `final/results/benchmark_20260216_011044_summary.txt`
-  - `final/results/benchmark_20260216_011044.csv`
-  - `final/results/benchmark_20260216_011044_protocol.json`
-
-Key simulated baseline results (nominal/default):
-- `hybrid_modern`: survival `1.000`, crash rate `0.000`, composite score `74.460`
-- `current`: survival `1.000`, crash rate `0.000`, composite score `73.993`
-- `baseline_robust_hinf_like`: survival `1.000`, crash rate `0.000`, composite score `75.457`
-- `paper_split_baseline`: survival `1.000`, crash rate `0.000`, composite score `72.913`
-- `baseline_mpc`: survival `0.625`, crash rate `0.375`
-
-Simulation protocol highlights:
-- control timing and delay (`250 Hz`, `1` step delay)
-- injected sensor noise
-- periodic disturbances
-- multi-family comparator framework and reproducible artifacts
-
-### Statistical visual graph (paper context vs simulation)
-
-![Paper vs simulation statistical comparison](results/paper_vs_sim_comparison.png)
-
-Graph inputs:
-- CSV: `final/results/benchmark_20260216_011044.csv`
-- Plot script: `final/plot_paper_vs_sim.py`
-- Re-generate:
-```bash
-python final/plot_paper_vs_sim.py --csv final/results/benchmark_20260216_011044.csv --out final/results/paper_vs_sim_comparison.png
-```
-
-### Nuanced claim boundary
-
-Reasonable claim:
-- This project advances **simulation evaluation rigor** (repeatability, explicit stress conditions, comparator breadth, and artifact traceability).
-- This project demonstrates stable balancing performance in simulation under configured noise, delay, and disturbance settings.
-
-Not yet a justified claim:
-- "Universally better control performance than the 2013 hardware robot" (not directly apples-to-apples without matched tasks/constraints).
-
-To make the comparison tighter in future work:
-- add a dedicated simulation benchmark that exactly matches the paper's trajectory tasks (`3.3 m` ramp, `1.1 m` ladder, `2.8 m` parabolic),
-- include matched speed limits and comparable sensor assumptions,
-- report the same tracking/error metrics side-by-side.
-
-## 12) Known Limits
-
-- This is still a simulation, not a certified hardware safety system.
-- Contact/friction/sensor models are approximations.
-- Real hardware requires calibration, safety interlocks, and staged testing.
-
-## 13) Architecture Ceiling (Decision)
-
-Yes: this architecture has reached its practical ceiling for the current plant.
-
-What is complete:
-- Root cause identified: marginally stable integrator poles (`lambda = 1.0`) create unavoidable long-horizon drift.
-- MPC implemented with hard constraints and integrated into the production control stack.
-- Long-run validation completed (multi-million-step campaigns) with clear documentation.
-
-Why further controller-only tuning will not remove crashes:
-- Two poles at `lambda = 1.0` mean no natural decay of drift.
-- COM support radius is a hard geometric boundary (`0.145 m`) that drift eventually reaches.
-- Even with good sensing, model mismatch/discretization/noise still accumulate over long horizons.
-- Similar long-run crash behavior under both LQR and MPC indicates a plant-limited regime, not a single-controller failure.
-
-If lower crash rate is required from here, the next moves are plant-level:
-- Increase support radius (larger footprint / stability margin).
-- Add an online disturbance observer (explicit drift estimation and compensation).
-- Redesign inertia/geometry to move closed-loop dominant modes away from the marginal boundary.
-- Add a hybrid landing/degrade mode near COM boundary.
-- Improve sensing/estimation stack for earlier drift detection.
-
-Conclusion:
-- Current MPC implementation is working as intended.
-- Remaining residual crash floor is physics-limited for this plant configuration.
-- This design is ready to ship within the stated claim boundaries.
 
 ---
 
-If you only read one file first, read `final/README.md` (this file), then open `final/final.py` and `final/final.xml` side-by-side.
+If you are extending this project, keep the same discipline:
+change one layer at a time, benchmark after each change, and log enough data to prove the change helped.

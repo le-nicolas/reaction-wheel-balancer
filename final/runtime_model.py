@@ -13,11 +13,18 @@ class ModelIds:
     q_roll: int
     q_base_x: int
     q_base_y: int
+    q_base_quat_w: int
+    q_base_quat_x: int
+    q_base_quat_y: int
+    q_base_quat_z: int
     v_pitch: int
     v_roll: int
     v_rw: int
     v_base_x: int
     v_base_y: int
+    v_base_ang_x: int
+    v_base_ang_y: int
+    v_base_ang_z: int
     aid_rw: int
     aid_base_x: int
     aid_base_y: int
@@ -40,17 +47,27 @@ def lookup_model_ids(model: mujoco.MjModel) -> ModelIds:
     jid_rw = jid("wheel_spin")
     jid_base_x = jid("base_x_slide")
     jid_base_y = jid("base_y_slide")
+    jid_base_free = jid("base_free")
+    qadr_base_free = int(model.jnt_qposadr[jid_base_free])
+    dadr_base_free = int(model.jnt_dofadr[jid_base_free])
 
     return ModelIds(
         q_pitch=model.jnt_qposadr[jid_pitch],
         q_roll=model.jnt_qposadr[jid_roll],
         q_base_x=model.jnt_qposadr[jid_base_x],
         q_base_y=model.jnt_qposadr[jid_base_y],
+        q_base_quat_w=qadr_base_free + 3,
+        q_base_quat_x=qadr_base_free + 4,
+        q_base_quat_y=qadr_base_free + 5,
+        q_base_quat_z=qadr_base_free + 6,
         v_pitch=model.jnt_dofadr[jid_pitch],
         v_roll=model.jnt_dofadr[jid_roll],
         v_rw=model.jnt_dofadr[jid_rw],
         v_base_x=model.jnt_dofadr[jid_base_x],
         v_base_y=model.jnt_dofadr[jid_base_y],
+        v_base_ang_x=dadr_base_free + 3,
+        v_base_ang_y=dadr_base_free + 4,
+        v_base_ang_z=dadr_base_free + 5,
         aid_rw=aid("wheel_spin"),
         aid_base_x=aid("base_x_force"),
         aid_base_y=aid("base_y_force"),
@@ -62,7 +79,25 @@ def lookup_model_ids(model: mujoco.MjModel) -> ModelIds:
     )
 
 
-def enforce_wheel_only_constraints(model, data, ids: ModelIds):
+def enforce_planar_root_attitude(model, data, ids: ModelIds, forward: bool = True):
+    """
+    Clamp free-joint attitude to upright.
+
+    This removes an unobservable/uncontrolled free-body tumble mode that can
+    dominate COM drift while stick-joint tilt remains small.
+    """
+    data.qpos[ids.q_base_quat_w] = 1.0
+    data.qpos[ids.q_base_quat_x] = 0.0
+    data.qpos[ids.q_base_quat_y] = 0.0
+    data.qpos[ids.q_base_quat_z] = 0.0
+    data.qvel[ids.v_base_ang_x] = 0.0
+    data.qvel[ids.v_base_ang_y] = 0.0
+    data.qvel[ids.v_base_ang_z] = 0.0
+    if forward:
+        mujoco.mj_forward(model, data)
+
+
+def enforce_wheel_only_constraints(model, data, ids: ModelIds, lock_root_attitude: bool = True):
     """Pin base translation + roll so wheel-only mode stays single-axis."""
     data.qpos[ids.q_base_x] = 0.0
     data.qpos[ids.q_base_y] = 0.0
@@ -70,6 +105,8 @@ def enforce_wheel_only_constraints(model, data, ids: ModelIds):
     data.qvel[ids.v_base_x] = 0.0
     data.qvel[ids.v_base_y] = 0.0
     data.qvel[ids.v_roll] = 0.0
+    if lock_root_attitude:
+        enforce_planar_root_attitude(model, data, ids, forward=False)
     mujoco.mj_forward(model, data)
 
 
@@ -94,12 +131,10 @@ def get_true_state(data, ids: ModelIds) -> np.ndarray:
 
 
 def reset_state(model, data, q_pitch, q_roll, pitch_eq=0.0, roll_eq=0.0):
-    data.qpos[:] = 0.0
+    # Start from XML-defined default pose (preserves freejoint height/orientation).
+    data.qpos[:] = model.qpos0
     data.qvel[:] = 0.0
     data.ctrl[:] = 0.0
-    # Fix invalid quaternion in freejoint (indices 3:7)
-    data.qpos[3] = 1.0  # w component of quaternion (identity rotation)
-    data.qpos[4:7] = 0.0  # x, y, z components
     data.qpos[q_pitch] = pitch_eq
     data.qpos[q_roll] = roll_eq
     mujoco.mj_forward(model, data)
@@ -223,6 +258,3 @@ def estimator_measurement_update(
         x_est[7] = x_true[7]
         x_est[8] = x_true[8]
     return x_est
-
-
-
