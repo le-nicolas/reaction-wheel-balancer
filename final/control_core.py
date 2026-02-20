@@ -371,16 +371,8 @@ def compute_control_command(
     u_rw_cmd = float(np.clip(u_rw_cmd, -rw_u_limit, rw_u_limit))
 
     if cfg.allow_base_motion:
-        tilt_span = max(cfg.base_tilt_full_authority_rad - cfg.base_tilt_deadband_rad, 1e-6)
-        tilt_mag = max(abs(x_est[0]), abs(x_est[1]))
-        base_authority_raw = float(np.clip((tilt_mag - cfg.base_tilt_deadband_rad) / tilt_span, 0.0, 1.0))
-        if high_spin_active:
-            base_authority_raw = max(base_authority_raw, cfg.high_spin_base_authority_min)
-        if tilt_mag > 1.5 * cfg.base_tilt_full_authority_rad:
-            base_authority_raw *= 0.55
-        max_auth_delta = cfg.base_authority_rate_per_s * control_dt
-        base_authority_state += float(np.clip(base_authority_raw - base_authority_state, -max_auth_delta, max_auth_delta))
-        base_authority = float(np.clip(base_authority_state, 0.0, 1.0))
+        # Always enable base authority for balance stabilization; reduce deadband effect
+        base_authority = 1.0
         follow_alpha = float(np.clip(cfg.base_ref_follow_rate_hz * control_dt, 0.0, 1.0))
         recenter_alpha = float(np.clip(cfg.base_ref_recenter_rate_hz * control_dt, 0.0, 1.0))
         base_disp = float(np.hypot(x_est[5], x_est[6]))
@@ -447,7 +439,6 @@ def compute_control_command(
     else:
         base_int[:] = 0.0
         base_ref[:] = 0.0
-        base_authority_state = 0.0
         du_base_cmd = -u_eff_applied[1:]
         du_hits[1:] += (np.abs(du_base_cmd) > cfg.max_du[1:]).astype(int)
         du_base = np.clip(du_base_cmd, -cfg.max_du[1:], cfg.max_du[1:])
