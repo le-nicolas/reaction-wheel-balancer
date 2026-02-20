@@ -9,75 +9,681 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import mujoco
+import numpy as np
+from scipy.linalg import solve_discrete_are
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FINAL_DIR = REPO_ROOT / "final"
 if str(FINAL_DIR) not in sys.path:
     sys.path.insert(0, str(FINAL_DIR))
 
-from unconstrained_runtime import UnconstrainedWheelBotRuntime  # noqa: E402
+from control_core import (  # noqa: E402
+    apply_control_delay,
+    apply_upright_postprocess,
+    base_commands_with_limits,
+    compute_control_command,
+    reset_controller_buffers,
+    wheel_command_with_limits,
+)
+from residual_model import ResidualPolicy  # noqa: E402
+from runtime_config import build_config, parse_args as parse_runtime_args  # noqa: E402
+from runtime_model import (  # noqa: E402
+    build_kalman_gain,
+    build_measurement_noise_cov,
+    build_partial_measurement_matrix,
+    compute_robot_com_distance_xy,
+    create_sensor_frontend_state,
+    enforce_planar_root_attitude,
+    enforce_wheel_only_constraints,
+    estimator_measurement_update,
+    get_true_state,
+    has_required_mujoco_sensors,
+    lookup_model_ids,
+    lookup_sensor_ids,
+    reset_sensor_frontend_state,
+    reset_state,
+    resolve_sensor_source,
+    set_payload_mass,
+)
+
+try:
+    from mpc_controller import MPCController  # noqa: E402
+except Exception:  # noqa: BLE001
+    MPCController = None
 
 
-class RuntimeThread:
-    def __init__(self, mode: str = "balanced", payload_mass: float = 0.4):
-        xml_path = FINAL_DIR / "final.xml"
-        self.runtime = UnconstrainedWheelBotRuntime(
-            xml_path=xml_path,
-            payload_mass_kg=float(payload_mass),
-            mode=mode,
-        )
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event()
+STABLE_CONFIRM_S = 4.0
+
+
+def _solve_discrete_are_robust(
+    A: np.ndarray,
+    B: np.ndarray,
+    Q: np.ndarray,
+    R: np.ndarray,
+    label: str,
+) -> np.ndarray:
+    reg_steps = (0.0, 1e-12, 1e-10, 1e-8, 1e-6)
+    eye = np.eye(R.shape[0], dtype=float)
+    last_exc: Exception | None = None
+    for eps in reg_steps:
+        try:
+            P = solve_discrete_are(A, B, Q, R + eps * eye)
+            if np.all(np.isfinite(P)):
+                return 0.5 * (P + P.T)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    raise RuntimeError(f"{label} DARE failed after regularization fallback: {last_exc}") from last_exc
+
+
+def _solve_linear_robust(gram: np.ndarray, rhs: np.ndarray, label: str) -> np.ndarray:
+    try:
+        return np.linalg.solve(gram, rhs)
+    except np.linalg.LinAlgError:
+        sol, *_ = np.linalg.lstsq(gram, rhs, rcond=None)
+        if not np.all(np.isfinite(sol)):
+            raise RuntimeError(f"{label} linear solve returned non-finite result.")
+        return sol
+
+
+def _runtime_cli_args(mode: str, payload_mass_kg: float) -> list[str]:
+    return [
+        "--mode",
+        mode,
+        "--payload-mass",
+        str(max(float(payload_mass_kg), 0.0)),
+        "--stop-on-crash",
+    ]
+
+
+class FullFinalRuntime:
+    """Headless runtime mirroring the current final.py control stack."""
+
+    def __init__(self, mode: str = "robust", payload_mass_kg: float = 0.4):
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.mode = str(mode)
+        self.requested_mass_kg = max(float(payload_mass_kg), 0.0)
+        self.max_stable_mass_kg = 0.0
+        self.stable_recorded = False
+        self.status_text = "Booting..."
+        self.failure_reason = ""
+        self.failed = False
         self.paused = False
-        self.thread = threading.Thread(target=self._loop, name="wheelbot-runtime", daemon=True)
-        self.thread.start()
 
-    def _loop(self):
+        self._build_runtime_locked(self.mode, self.requested_mass_kg)
+
+        self._thread = threading.Thread(target=self._run_loop, name="full-final-runtime", daemon=True)
+        self._thread.start()
+
+    def _build_runtime_locked(self, mode: str, payload_mass_kg: float):
+        args = parse_runtime_args(_runtime_cli_args(mode=mode, payload_mass_kg=payload_mass_kg))
+        cfg = build_config(args)
+        residual_policy = ResidualPolicy(cfg)
+        initial_roll_rad = float(np.radians(args.initial_y_tilt_deg))
+
+        xml_path = FINAL_DIR / "final.xml"
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
+        data = mujoco.MjData(model)
+
+        if cfg.smooth_viewer and cfg.easy_mode:
+            model.opt.gravity[2] = -6.5
+
+        ids = lookup_model_ids(model)
+        sensor_ids = lookup_sensor_ids(model)
+        mujoco_sensor_available = has_required_mujoco_sensors(cfg, sensor_ids)
+        sensor_source = resolve_sensor_source(cfg, sensor_ids)
+
+        payload_mass = set_payload_mass(model, data, ids, cfg.payload_mass_kg)
+        reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
+        if cfg.lock_root_attitude:
+            enforce_planar_root_attitude(model, data, ids)
+
+        nx = 2 * model.nv + model.na
+        nu = model.nu
+        A_full = np.zeros((nx, nx), dtype=float)
+        B_full = np.zeros((nx, nu), dtype=float)
+        mujoco.mjd_transitionFD(model, data, 1e-6, True, A_full, B_full, None, None)
+
+        idx = [
+            ids.v_pitch,
+            ids.v_roll,
+            model.nv + ids.v_pitch,
+            model.nv + ids.v_roll,
+            model.nv + ids.v_rw,
+            ids.v_base_x,
+            ids.v_base_y,
+            model.nv + ids.v_base_x,
+            model.nv + ids.v_base_y,
+        ]
+        A = A_full[np.ix_(idx, idx)]
+        B = B_full[np.ix_(idx, [ids.aid_rw, ids.aid_base_x, ids.aid_base_y])]
+        NX = A.shape[0]
+        NU = B.shape[1]
+
+        A_aug = np.block([[A, B], [np.zeros((NU, NX)), np.eye(NU)]])
+        B_aug = np.vstack([B, np.eye(NU)])
+        Q_aug = np.block([[cfg.qx, np.zeros((NX, NU))], [np.zeros((NU, NX)), cfg.qu]])
+        P_aug = _solve_discrete_are_robust(A_aug, B_aug, Q_aug, cfg.r_du, label="Controller")
+        K_du = _solve_linear_robust(B_aug.T @ P_aug @ B_aug + cfg.r_du, B_aug.T @ P_aug @ A_aug, label="Controller gain")
+
+        K_paper_pitch = None
+        K_wheel_only = None
+        need_paper_pitch = cfg.wheel_only or (cfg.controller_family == "paper_split_baseline")
+        if need_paper_pitch:
+            A_w = A[np.ix_([0, 2, 4], [0, 2, 4])]
+            B_w = B[np.ix_([0, 2, 4], [0])]
+            Q_w = np.diag([260.0, 35.0, 0.6])
+            R_w = np.array([[0.08]])
+            try:
+                P_w = _solve_discrete_are_robust(A_w, B_w, Q_w, R_w, label="Paper pitch")
+                K_paper_pitch = _solve_linear_robust(B_w.T @ P_w @ B_w + R_w, B_w.T @ P_w @ A_w, label="Paper pitch gain")
+            except RuntimeError:
+                K_paper_pitch = None
+        if cfg.wheel_only:
+            if K_paper_pitch is not None:
+                K_wheel_only = K_paper_pitch.copy()
+            else:
+                K_wheel_only = np.array([[cfg.wheel_only_pitch_kp, cfg.wheel_only_pitch_kd, 0.0]], dtype=float)
+
+        control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
+        control_dt = control_steps * model.opt.timestep
+        wheel_lsb = (2.0 * np.pi) / (cfg.wheel_encoder_ticks_per_rev * control_dt)
+        wheel_budget_speed = min(cfg.wheel_spin_budget_frac * cfg.max_wheel_speed_rad_s, cfg.wheel_spin_budget_abs_rad_s)
+        wheel_hard_speed = min(cfg.wheel_spin_hard_frac * cfg.max_wheel_speed_rad_s, cfg.wheel_spin_hard_abs_rad_s)
+        if not cfg.allow_base_motion:
+            wheel_hard_speed *= 1.10
+
+        C = build_partial_measurement_matrix(cfg)
+        Qn = np.diag([1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-5, 1e-5, 1e-5])
+        Rn = build_measurement_noise_cov(cfg, wheel_lsb)
+        L = build_kalman_gain(A, Qn, C, Rn)
+
+        ACT_IDS = np.array([ids.aid_rw, ids.aid_base_x, ids.aid_base_y], dtype=int)
+        ACT_NAMES = np.array(["wheel_spin", "base_x_force", "base_y_force"])
+        XML_CTRL_LOW = model.actuator_ctrlrange[ACT_IDS, 0]
+        XML_CTRL_HIGH = model.actuator_ctrlrange[ACT_IDS, 1]
+        for i, name in enumerate(ACT_NAMES):
+            if XML_CTRL_LOW[i] > -cfg.max_u[i] or XML_CTRL_HIGH[i] < cfg.max_u[i]:
+                raise ValueError(
+                    f"{name}: xml=[{XML_CTRL_LOW[i]:.3f}, {XML_CTRL_HIGH[i]:.3f}] vs python=+/-{cfg.max_u[i]:.3f}"
+                )
+
+        mpc_controller = None
+        if cfg.use_mpc:
+            if MPCController is None:
+                raise RuntimeError("MPC is enabled but mpc_controller.py import failed.")
+            q_diag = np.array(
+                [
+                    cfg.mpc_q_angles,
+                    cfg.mpc_q_angles,
+                    cfg.mpc_q_rates,
+                    cfg.mpc_q_rates,
+                    1.0,
+                    cfg.mpc_q_position,
+                    cfg.mpc_q_position,
+                    cfg.mpc_q_rates,
+                    cfg.mpc_q_rates,
+                ]
+            )
+            r_diag = np.array([cfg.mpc_r_control, cfg.mpc_r_control, cfg.mpc_r_control])
+            mpc_controller = MPCController(
+                A=A,
+                B=B,
+                horizon=cfg.mpc_horizon,
+                q_diag=q_diag,
+                r_diag=r_diag,
+                terminal_weight=cfg.mpc_terminal_weight,
+                u_max=cfg.max_u,
+                com_radius_m=cfg.mpc_com_constraint_radius_m,
+                angle_max_rad=cfg.crash_angle_rad,
+                verbose=cfg.mpc_verbose,
+            )
+
+        sensor_frontend_state = create_sensor_frontend_state(cfg)
+        reset_sensor_frontend_state(sensor_frontend_state)
+
+        queue_len = 1 if not cfg.hardware_realistic else cfg.control_delay_steps + 1
+        (
+            x_est,
+            u_applied,
+            u_eff_applied,
+            base_int,
+            wheel_pitch_int,
+            base_ref,
+            base_authority_state,
+            u_base_smooth,
+            balance_phase,
+            recovery_time_s,
+            high_spin_active,
+            cmd_queue,
+        ) = reset_controller_buffers(NX, NU, queue_len)
+
+        self.mode = str(mode)
+        self.cfg = cfg
+        self.runtime_args = args
+        self.residual_policy = residual_policy
+        self.model = model
+        self.data = data
+        self.ids = ids
+        self.sensor_ids = sensor_ids
+        self.mujoco_sensor_available = bool(mujoco_sensor_available)
+        self.sensor_source = sensor_source
+        self.sensor_frontend_state = sensor_frontend_state
+        self.initial_roll_rad = initial_roll_rad
+        self.payload_mass_kg = float(payload_mass)
+        self.requested_mass_kg = max(float(payload_mass_kg), 0.0)
+        self.A = A
+        self.B = B
+        self.K_du = K_du
+        self.K_wheel_only = K_wheel_only
+        self.K_paper_pitch = K_paper_pitch
+        self.control_steps = int(control_steps)
+        self.control_dt = float(control_dt)
+        self.wheel_lsb = float(wheel_lsb)
+        self.wheel_budget_speed = float(wheel_budget_speed)
+        self.wheel_hard_speed = float(wheel_hard_speed)
+        self.C = C
+        self.L = L
+        self.XML_CTRL_LOW = XML_CTRL_LOW
+        self.XML_CTRL_HIGH = XML_CTRL_HIGH
+        self.mpc_controller = mpc_controller
+        self.rng = np.random.default_rng(cfg.seed)
+        self.x_est = x_est
+        self.u_applied = u_applied
+        self.u_eff_applied = u_eff_applied
+        self.base_int = base_int
+        self.wheel_pitch_int = wheel_pitch_int
+        self.base_ref = base_ref
+        self.base_authority_state = base_authority_state
+        self.u_base_smooth = u_base_smooth
+        self.balance_phase = balance_phase
+        self.recovery_time_s = recovery_time_s
+        self.high_spin_active = high_spin_active
+        self.cmd_queue = cmd_queue
+        self.upright_blend = 0.0
+        self.despin_gain = 0.25
+
+        self.sat_hits = np.zeros(NU, dtype=int)
+        self.du_hits = np.zeros(NU, dtype=int)
+        self.xml_limit_margin_hits = np.zeros(NU, dtype=int)
+        self.speed_limit_hits = np.zeros(5, dtype=int)
+        self.derate_hits = np.zeros(3, dtype=int)
+        self.step_count = 0
+        self.control_updates = 0
+        self.crash_count = 0
+        self.max_pitch = 0.0
+        self.max_roll = 0.0
+        self.phase_switch_count = 0
+        self.hold_steps = 0
+        self.wheel_over_budget_count = 0
+        self.wheel_over_hard_count = 0
+        self.high_spin_steps = 0
+        self.wheel_speed_abs_sum = 0.0
+        self.wheel_speed_abs_max = 0.0
+        self.wheel_speed_samples = 0
+        self.wheel_hard_same_dir_request_count = 0
+        self.wheel_hard_safe_output_count = 0
+        self.residual_applied_count = 0
+        self.residual_clipped_count = 0
+        self.residual_gate_blocked_count = 0
+        self.residual_max_abs = np.zeros(NU, dtype=float)
+        self.com_planar_dist = compute_robot_com_distance_xy(model, data, ids.base_y_body_id)
+        self.max_com_planar_dist = self.com_planar_dist
+        self.com_over_support_steps = 0
+        self.com_fail_streak = 0
+        self.com_overload_failures = 0
+        self.failed = False
+        self.failure_reason = ""
+        self.paused = False
+        self.stable_recorded = False
+        self.status_text = "Running"
+
+    def _reset_after_instability_locked(self):
+        reset_state(
+            self.model,
+            self.data,
+            self.ids.q_pitch,
+            self.ids.q_roll,
+            pitch_eq=0.0,
+            roll_eq=self.initial_roll_rad,
+        )
+        if self.cfg.wheel_only:
+            enforce_wheel_only_constraints(
+                self.model,
+                self.data,
+                self.ids,
+                lock_root_attitude=self.cfg.lock_root_attitude,
+            )
+        elif self.cfg.lock_root_attitude:
+            enforce_planar_root_attitude(self.model, self.data, self.ids)
+
+        self.com_fail_streak = 0
+        queue_len = 1 if not self.cfg.hardware_realistic else self.cfg.control_delay_steps + 1
+        (
+            self.x_est,
+            self.u_applied,
+            self.u_eff_applied,
+            self.base_int,
+            self.wheel_pitch_int,
+            self.base_ref,
+            self.base_authority_state,
+            self.u_base_smooth,
+            self.balance_phase,
+            self.recovery_time_s,
+            self.high_spin_active,
+            self.cmd_queue,
+        ) = reset_controller_buffers(self.A.shape[0], self.B.shape[1], queue_len)
+        reset_sensor_frontend_state(self.sensor_frontend_state)
+        self.upright_blend = 0.0
+
+    def _step_once_locked(self):
+        self.step_count += 1
+
+        if self.cfg.wheel_only:
+            enforce_wheel_only_constraints(
+                self.model,
+                self.data,
+                self.ids,
+                lock_root_attitude=self.cfg.lock_root_attitude,
+            )
+        elif self.cfg.lock_root_attitude:
+            enforce_planar_root_attitude(self.model, self.data, self.ids)
+
+        x_true = get_true_state(self.data, self.ids)
+        self.com_planar_dist = compute_robot_com_distance_xy(self.model, self.data, self.ids.base_y_body_id)
+        self.max_com_planar_dist = max(self.max_com_planar_dist, self.com_planar_dist)
+
+        if not np.all(np.isfinite(x_true)):
+            self._reset_after_instability_locked()
+            self.status_text = "Reset after numerical instability"
+            return
+
+        x_pred = self.A @ self.x_est + self.B @ self.u_eff_applied
+        self.x_est = x_pred
+
+        if self.step_count % self.control_steps == 0:
+            self.control_updates += 1
+            self.x_est = estimator_measurement_update(
+                self.cfg,
+                x_true,
+                x_pred,
+                self.C,
+                self.L,
+                self.rng,
+                self.wheel_lsb,
+                data=self.data,
+                sensor_ids=self.sensor_ids,
+                sensor_source=self.sensor_source,
+                sensor_state=self.sensor_frontend_state,
+                sim_time_s=float(self.data.time),
+                control_dt=self.control_dt,
+            )
+
+            angle_mag = max(abs(float(x_true[0])), abs(float(x_true[1])))
+            rate_mag = max(abs(float(x_true[2])), abs(float(x_true[3])))
+            prev_phase = self.balance_phase
+            if self.balance_phase == "recovery":
+                if angle_mag < self.cfg.hold_enter_angle_rad and rate_mag < self.cfg.hold_enter_rate_rad_s:
+                    self.balance_phase = "hold"
+                    self.recovery_time_s = 0.0
+            else:
+                if angle_mag > self.cfg.hold_exit_angle_rad or rate_mag > self.cfg.hold_exit_rate_rad_s:
+                    self.balance_phase = "recovery"
+                    self.recovery_time_s = 0.0
+            if self.balance_phase != prev_phase:
+                self.phase_switch_count += 1
+            if self.balance_phase == "recovery":
+                self.recovery_time_s += self.control_dt
+
+            (
+                u_cmd,
+                self.base_int,
+                self.base_ref,
+                self.base_authority_state,
+                self.u_base_smooth,
+                self.wheel_pitch_int,
+                rw_u_limit,
+                wheel_over_budget,
+                wheel_over_hard,
+                self.high_spin_active,
+                _control_terms,
+            ) = compute_control_command(
+                cfg=self.cfg,
+                x_est=self.x_est,
+                x_true=x_true,
+                u_eff_applied=self.u_eff_applied,
+                base_int=self.base_int,
+                base_ref=self.base_ref,
+                base_authority_state=self.base_authority_state,
+                u_base_smooth=self.u_base_smooth,
+                wheel_pitch_int=self.wheel_pitch_int,
+                balance_phase=self.balance_phase,
+                recovery_time_s=self.recovery_time_s,
+                high_spin_active=self.high_spin_active,
+                control_dt=self.control_dt,
+                K_du=self.K_du,
+                K_wheel_only=self.K_wheel_only,
+                K_paper_pitch=self.K_paper_pitch,
+                du_hits=self.du_hits,
+                sat_hits=self.sat_hits,
+                mpc_controller=self.mpc_controller,
+            )
+
+            residual_step = self.residual_policy.step(
+                x_est=self.x_est,
+                x_true=x_true,
+                u_nominal=u_cmd,
+                u_eff_applied=self.u_eff_applied,
+            )
+            residual_delta = residual_step.delta_u
+            self.residual_gate_blocked_count += int(residual_step.gate_blocked)
+            if residual_step.applied:
+                self.residual_applied_count += 1
+                self.residual_clipped_count += int(residual_step.clipped)
+                self.residual_max_abs = np.maximum(self.residual_max_abs, np.abs(residual_delta))
+                u_cmd = u_cmd + residual_delta
+
+            self.wheel_over_budget_count += int(wheel_over_budget)
+            self.wheel_over_hard_count += int(wheel_over_hard)
+
+            u_cmd, self.upright_blend = apply_upright_postprocess(
+                cfg=self.cfg,
+                u_cmd=u_cmd,
+                x_est=self.x_est,
+                x_true=x_true,
+                upright_blend=self.upright_blend,
+                balance_phase=self.balance_phase,
+                high_spin_active=self.high_spin_active,
+                despin_gain=self.despin_gain,
+                rw_u_limit=rw_u_limit,
+            )
+
+            self.xml_limit_margin_hits += ((u_cmd < self.XML_CTRL_LOW) | (u_cmd > self.XML_CTRL_HIGH)).astype(int)
+            self.u_applied = apply_control_delay(self.cfg, self.cmd_queue, u_cmd)
+
+        if self.balance_phase == "hold":
+            self.hold_steps += 1
+        if self.high_spin_active:
+            self.high_spin_steps += 1
+
+        self.data.ctrl[:] = 0.0
+        wheel_speed = float(self.data.qvel[self.ids.v_rw])
+        if (
+            abs(wheel_speed) >= self.wheel_hard_speed
+            and abs(float(self.u_applied[0])) > 1e-9
+            and np.sign(float(self.u_applied[0])) == np.sign(wheel_speed)
+        ):
+            self.wheel_hard_same_dir_request_count += 1
+
+        wheel_cmd = wheel_command_with_limits(self.cfg, wheel_speed, float(self.u_applied[0]))
+        if abs(wheel_speed) >= self.wheel_hard_speed:
+            if abs(wheel_cmd) <= 1e-9 or (abs(wheel_speed) > 1e-9 and np.sign(wheel_cmd) != np.sign(wheel_speed)):
+                self.wheel_hard_safe_output_count += 1
+        self.derate_hits[0] += int(abs(wheel_cmd - self.u_applied[0]) > 1e-9)
+        self.data.ctrl[self.ids.aid_rw] = wheel_cmd
+
+        if self.cfg.allow_base_motion:
+            base_x_cmd, base_y_cmd = base_commands_with_limits(
+                cfg=self.cfg,
+                base_x_speed=float(self.data.qvel[self.ids.v_base_x]),
+                base_y_speed=float(self.data.qvel[self.ids.v_base_y]),
+                base_x=float(self.data.qpos[self.ids.q_base_x]),
+                base_y=float(self.data.qpos[self.ids.q_base_y]),
+                base_x_request=float(self.u_applied[1]),
+                base_y_request=float(self.u_applied[2]),
+            )
+        else:
+            base_x_cmd = 0.0
+            base_y_cmd = 0.0
+        self.derate_hits[1] += int(abs(base_x_cmd - self.u_applied[1]) > 1e-9)
+        self.derate_hits[2] += int(abs(base_y_cmd - self.u_applied[2]) > 1e-9)
+        self.data.ctrl[self.ids.aid_base_x] = base_x_cmd
+        self.data.ctrl[self.ids.aid_base_y] = base_y_cmd
+        self.u_eff_applied[:] = [wheel_cmd, base_x_cmd, base_y_cmd]
+
+        mujoco.mj_step(self.model, self.data)
+        if self.cfg.wheel_only:
+            enforce_wheel_only_constraints(
+                self.model,
+                self.data,
+                self.ids,
+                lock_root_attitude=self.cfg.lock_root_attitude,
+            )
+        elif self.cfg.lock_root_attitude:
+            enforce_planar_root_attitude(self.model, self.data, self.ids)
+
+        wheel_speed_after = float(self.data.qvel[self.ids.v_rw])
+        wheel_speed_abs_after = abs(wheel_speed_after)
+        self.wheel_speed_abs_sum += wheel_speed_abs_after
+        self.wheel_speed_abs_max = max(self.wheel_speed_abs_max, wheel_speed_abs_after)
+        self.wheel_speed_samples += 1
+
+        self.speed_limit_hits[0] += int(abs(self.data.qvel[self.ids.v_rw]) > self.cfg.max_wheel_speed_rad_s)
+        self.speed_limit_hits[1] += int(abs(self.data.qvel[self.ids.v_pitch]) > self.cfg.max_pitch_roll_rate_rad_s)
+        self.speed_limit_hits[2] += int(abs(self.data.qvel[self.ids.v_roll]) > self.cfg.max_pitch_roll_rate_rad_s)
+        self.speed_limit_hits[3] += int(abs(self.data.qvel[self.ids.v_base_x]) > self.cfg.max_base_speed_m_s)
+        self.speed_limit_hits[4] += int(abs(self.data.qvel[self.ids.v_base_y]) > self.cfg.max_base_speed_m_s)
+
+        self.com_planar_dist = compute_robot_com_distance_xy(self.model, self.data, self.ids.base_y_body_id)
+        self.max_com_planar_dist = max(self.max_com_planar_dist, self.com_planar_dist)
+        if self.com_planar_dist > self.cfg.payload_support_radius_m:
+            self.com_over_support_steps += 1
+            self.com_fail_streak += 1
+        else:
+            self.com_fail_streak = 0
+
+        pitch = float(self.data.qpos[self.ids.q_pitch])
+        roll = float(self.data.qpos[self.ids.q_roll])
+        self.max_pitch = max(self.max_pitch, abs(pitch))
+        self.max_roll = max(self.max_roll, abs(roll))
+
+        pitch_failed = abs(pitch) >= self.cfg.crash_angle_rad
+        roll_failed = abs(roll) >= self.cfg.crash_angle_rad
+        tilt_failed = pitch_failed or roll_failed
+        com_failed = self.com_fail_streak >= self.cfg.payload_com_fail_steps
+        if tilt_failed or com_failed:
+            self.crash_count += 1
+            self.com_overload_failures += int(com_failed)
+            self.failed = True
+            self.failure_reason = "COM overload" if com_failed else ("pitch_tilt" if pitch_failed else "roll_tilt")
+            self.status_text = f"Failed: {self.failure_reason}"
+            if self.cfg.stop_on_crash:
+                self.paused = True
+                return
+
+            self._reset_after_instability_locked()
+            self.failed = False
+            self.failure_reason = ""
+            return
+
+        if (not self.stable_recorded) and float(self.data.time) >= STABLE_CONFIRM_S:
+            self.stable_recorded = True
+            self.max_stable_mass_kg = max(self.max_stable_mass_kg, self.requested_mass_kg)
+            self.status_text = "Stable"
+        elif not self.paused:
+            self.status_text = "Running"
+
+    def _run_loop(self):
         next_tick = time.perf_counter()
-        while not self.stop_event.is_set():
-            with self.lock:
-                dt = float(self.runtime.model.opt.timestep)
-                if not self.paused and not self.runtime.failed:
-                    self.runtime.step()
-            next_tick += dt
+        while not self._stop_event.is_set():
+            with self._lock:
+                timestep = float(self.model.opt.timestep) if self.model is not None else 0.001
+                if not self.paused and not self.failed:
+                    self._step_once_locked()
+                elif self.failed:
+                    self.status_text = f"Failed: {self.failure_reason}" if self.failure_reason else "Failed"
+                else:
+                    self.status_text = "Paused"
+
+            next_tick += timestep
             sleep_s = next_tick - time.perf_counter()
             if sleep_s > 0:
                 time.sleep(min(sleep_s, 0.010))
             else:
                 next_tick = time.perf_counter()
 
-    def get_state(self) -> dict:
-        with self.lock:
-            s = self.runtime.get_state()
-            s["paused"] = bool(self.paused)
-            return s
+    def set_paused(self, paused: bool):
+        with self._lock:
+            self.paused = bool(paused)
+            if self.failed:
+                self.status_text = f"Failed: {self.failure_reason}" if self.failure_reason else "Failed"
+            elif self.paused:
+                self.status_text = "Paused"
+            else:
+                self.status_text = "Running"
 
     def reset(self, payload_mass_kg: float | None = None, mode: str | None = None) -> dict:
-        with self.lock:
-            self.runtime.reset(payload_mass_kg=payload_mass_kg, mode=mode)
+        with self._lock:
+            next_mode = self.mode if mode is None else str(mode)
+            next_mass = self.requested_mass_kg if payload_mass_kg is None else max(float(payload_mass_kg), 0.0)
+            self._build_runtime_locked(next_mode, next_mass)
+            self.failed = False
+            self.failure_reason = ""
             self.paused = False
-            s = self.runtime.get_state()
-            s["paused"] = False
-            return s
+            self.status_text = "Running"
+            return self._state_locked()
 
-    def set_paused(self, paused: bool) -> dict:
-        with self.lock:
-            self.paused = bool(paused)
-            s = self.runtime.get_state()
-            s["paused"] = self.paused
-            if self.paused and not s["failed"]:
-                s["status"] = "Paused"
-            return s
+    def _state_locked(self) -> dict:
+        geom_xpos = np.asarray(self.data.geom_xpos, dtype=float).reshape(-1).tolist()
+        geom_xmat = np.asarray(self.data.geom_xmat, dtype=float).reshape(-1).tolist()
+        return {
+            "ok": True,
+            "status": self.status_text,
+            "mode": self.mode,
+            "paused": bool(self.paused),
+            "failed": bool(self.failed),
+            "failure_reason": self.failure_reason,
+            "elapsed_s": float(self.data.time),
+            "requested_mass_kg": float(self.requested_mass_kg),
+            "effective_mass_kg": float(self.payload_mass_kg),
+            "max_stable_mass_kg": float(self.max_stable_mass_kg),
+            "com_dist_m": float(self.com_planar_dist),
+            "pitch_rad": float(self.data.qpos[self.ids.q_pitch]),
+            "roll_rad": float(self.data.qpos[self.ids.q_roll]),
+            "step_count": int(self.step_count),
+            "control_updates": int(self.control_updates),
+            "sensor_source": self.sensor_source,
+            "mujoco_sensor_available": bool(self.mujoco_sensor_available),
+            "ngeom": int(self.model.ngeom),
+            "geom_xpos": geom_xpos,
+            "geom_xmat": geom_xmat,
+        }
+
+    def get_state(self) -> dict:
+        with self._lock:
+            return self._state_locked()
 
     def shutdown(self):
-        self.stop_event.set()
-        self.thread.join(timeout=2.0)
+        self._stop_event.set()
+        self._thread.join(timeout=2.0)
 
 
 class AppServer(ThreadingHTTPServer):
-    def __init__(self, server_address, handler_cls, runtime_thread: RuntimeThread):
+    def __init__(self, server_address, handler_cls, runtime: FullFinalRuntime):
         super().__init__(server_address, handler_cls)
-        self.runtime_thread = runtime_thread
+        self.runtime = runtime
 
 
 class ApiStaticHandler(SimpleHTTPRequestHandler):
@@ -109,10 +715,10 @@ class ApiStaticHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            self._write_json({"ok": True, "service": "unconstrained-wheelbot-runtime"})
+            self._write_json({"ok": True, "service": "full-final-runtime"})
             return
         if path == "/api/state":
-            self._write_json(self.server.runtime_thread.get_state())
+            self._write_json(self.server.runtime.get_state())
             return
         super().do_GET()
 
@@ -123,33 +729,36 @@ class ApiStaticHandler(SimpleHTTPRequestHandler):
             mass = payload.get("payload_mass_kg", None)
             mode = payload.get("mode", None)
             try:
-                s = self.server.runtime_thread.reset(payload_mass_kg=mass, mode=mode)
+                state = self.server.runtime.reset(payload_mass_kg=mass, mode=mode)
             except Exception as exc:  # noqa: BLE001
                 self._write_json({"ok": False, "error": str(exc)}, status=400)
                 return
-            self._write_json(s)
+            self._write_json(state)
             return
+
         if path == "/api/pause":
             payload = self._read_json()
             paused_value = payload.get("paused", None)
             if paused_value is None:
-                paused_value = not bool(self.server.runtime_thread.get_state().get("paused", False))
-            s = self.server.runtime_thread.set_paused(bool(paused_value))
-            self._write_json(s)
+                current = self.server.runtime.get_state().get("paused", False)
+                paused_value = not bool(current)
+            self.server.runtime.set_paused(bool(paused_value))
+            self._write_json(self.server.runtime.get_state())
             return
+
         self._write_json({"ok": False, "error": "Unknown API endpoint"}, status=404)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Unconstrained wheel-bot web server")
+    parser = argparse.ArgumentParser(description="Full final.py runtime web server")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
-    parser.add_argument("--mode", choices=["balanced", "aggressive", "soft"], default="balanced")
+    parser.add_argument("--mode", choices=["smooth", "robust"], default="robust")
     parser.add_argument("--payload-mass", type=float, default=0.4)
     args = parser.parse_args()
 
-    runtime_thread = RuntimeThread(mode=args.mode, payload_mass=float(args.payload_mass))
-    server = AppServer((args.host, args.port), ApiStaticHandler, runtime_thread)
+    runtime = FullFinalRuntime(mode=args.mode, payload_mass_kg=args.payload_mass)
+    server = AppServer((args.host, args.port), ApiStaticHandler, runtime)
     print(f"Serving on http://{args.host}:{args.port}/web/")
     try:
         server.serve_forever()
@@ -157,7 +766,7 @@ def main():
         pass
     finally:
         server.server_close()
-        runtime_thread.shutdown()
+        runtime.shutdown()
 
 
 if __name__ == "__main__":
