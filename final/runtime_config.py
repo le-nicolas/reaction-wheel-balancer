@@ -59,6 +59,16 @@ class RuntimeConfig:
     residual_max_abs_u: np.ndarray
     residual_gate_tilt_rad: float
     residual_gate_rate_rad_s: float
+    dob_enabled: bool
+    dob_gain: float
+    dob_leak_per_s: float
+    dob_max_abs_u: np.ndarray
+    gain_schedule_enabled: bool
+    gain_schedule_min: float
+    gain_schedule_max: float
+    gain_schedule_disturbance_ref: float
+    gain_schedule_rate_per_s: float
+    gain_schedule_weights: np.ndarray
     max_u: np.ndarray
     max_du: np.ndarray
     disturbance_magnitude: float
@@ -198,13 +208,19 @@ def parse_args(argv=None):
         "--residual-model",
         type=str,
         default=None,
-        help="Optional PyTorch residual model checkpoint path (.pt/.pth).",
+        help=(
+            "Optional PyTorch residual checkpoint (.pt/.pth). "
+            "Expected feature order: x_est[9], u_eff_applied[3], u_nominal[3]."
+        ),
     )
     parser.add_argument(
         "--residual-scale",
         type=float,
         default=0.0,
-        help="Global multiplier for residual command output (0 disables residual path).",
+        help=(
+            "Multiplier on residual output after model output_scale calibration. "
+            "0 disables residual path; 0.20 means 20%% residual authority before max-abs clipping."
+        ),
     )
     parser.add_argument(
         "--residual-max-rw",
@@ -235,6 +251,90 @@ def parse_args(argv=None):
         type=float,
         default=3.0,
         help="Disable residual output when |pitch_rate|/|roll_rate| exceeds this value (rad/s).",
+    )
+    parser.add_argument(
+        "--enable-dob",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable adaptive disturbance observer (DOb) compensation on LQR path.",
+    )
+    parser.add_argument(
+        "--dob-gain",
+        type=float,
+        default=14.0,
+        help="Observer adaptation gain (1/s) for disturbance estimate update.",
+    )
+    parser.add_argument(
+        "--dob-leak-per-s",
+        type=float,
+        default=0.6,
+        help="Leak rate (1/s) to decay disturbance estimate in calm conditions.",
+    )
+    parser.add_argument(
+        "--dob-max-rw",
+        type=float,
+        default=6.0,
+        help="Max absolute DOb compensation magnitude on wheel channel.",
+    )
+    parser.add_argument(
+        "--dob-max-bx",
+        type=float,
+        default=1.0,
+        help="Max absolute DOb compensation magnitude on base-x channel.",
+    )
+    parser.add_argument(
+        "--dob-max-by",
+        type=float,
+        default=1.0,
+        help="Max absolute DOb compensation magnitude on base-y channel.",
+    )
+    parser.add_argument(
+        "--enable-gain-scheduling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable real-time gain scheduling from disturbance estimate magnitude.",
+    )
+    parser.add_argument(
+        "--gain-sched-min",
+        type=float,
+        default=1.0,
+        help="Minimum gain schedule multiplier.",
+    )
+    parser.add_argument(
+        "--gain-sched-max",
+        type=float,
+        default=1.8,
+        help="Maximum gain schedule multiplier under large disturbances.",
+    )
+    parser.add_argument(
+        "--gain-sched-ref",
+        type=float,
+        default=2.0,
+        help="Disturbance magnitude reference at which schedule approaches max.",
+    )
+    parser.add_argument(
+        "--gain-sched-rate-per-s",
+        type=float,
+        default=3.0,
+        help="Rate limit (1/s) for schedule multiplier changes.",
+    )
+    parser.add_argument(
+        "--gain-sched-rw-weight",
+        type=float,
+        default=1.0,
+        help="Disturbance weighting for wheel channel in schedule magnitude.",
+    )
+    parser.add_argument(
+        "--gain-sched-bx-weight",
+        type=float,
+        default=0.6,
+        help="Disturbance weighting for base-x channel in schedule magnitude.",
+    )
+    parser.add_argument(
+        "--gain-sched-by-weight",
+        type=float,
+        default=0.6,
+        help="Disturbance weighting for base-y channel in schedule magnitude.",
     )
     parser.add_argument(
         "--preset",
@@ -945,6 +1045,37 @@ def build_config(args) -> RuntimeConfig:
     residual_max_abs_u = np.minimum(residual_max_abs_u, max_u)
     residual_gate_tilt_rad = float(np.radians(max(float(getattr(args, "residual_gate_tilt_deg", 0.0)), 0.0)))
     residual_gate_rate_rad_s = float(max(float(getattr(args, "residual_gate_rate", 0.0)), 0.0))
+    dob_enabled = bool(getattr(args, "enable_dob", False))
+    gain_schedule_enabled = bool(getattr(args, "enable_gain_scheduling", False))
+    if gain_schedule_enabled:
+        dob_enabled = True
+    dob_gain = float(max(float(getattr(args, "dob_gain", 14.0)), 0.0))
+    dob_leak_per_s = float(max(float(getattr(args, "dob_leak_per_s", 0.6)), 0.0))
+    dob_max_abs_u = np.array(
+        [
+            max(float(getattr(args, "dob_max_rw", 0.0)), 0.0),
+            max(float(getattr(args, "dob_max_bx", 0.0)), 0.0),
+            max(float(getattr(args, "dob_max_by", 0.0)), 0.0),
+        ],
+        dtype=float,
+    )
+    dob_max_abs_u = np.minimum(dob_max_abs_u, max_u)
+    gain_schedule_min = float(max(float(getattr(args, "gain_sched_min", 1.0)), 0.1))
+    gain_schedule_max = float(max(float(getattr(args, "gain_sched_max", 1.8)), gain_schedule_min))
+    gain_schedule_disturbance_ref = float(max(float(getattr(args, "gain_sched_ref", 2.0)), 1e-6))
+    gain_schedule_rate_per_s = float(max(float(getattr(args, "gain_sched_rate_per_s", 3.0)), 0.0))
+    gain_schedule_weights = np.array(
+        [
+            max(float(getattr(args, "gain_sched_rw_weight", 1.0)), 0.0),
+            max(float(getattr(args, "gain_sched_bx_weight", 0.6)), 0.0),
+            max(float(getattr(args, "gain_sched_by_weight", 0.6)), 0.0),
+        ],
+        dtype=float,
+    )
+    if float(np.sum(gain_schedule_weights)) <= 1e-9:
+        gain_schedule_weights = np.ones(3, dtype=float)
+    if real_hardware_profile:
+        gain_schedule_max = min(gain_schedule_max, 1.4)
     payload_mass_kg = float(max(getattr(args, "payload_mass", 0.0), 0.0))
     payload_support_radius_m = float(max(getattr(args, "payload_support_radius_m", 0.145), 0.01))
     payload_com_fail_steps = int(max(getattr(args, "payload_com_fail_steps", 15), 1))
@@ -983,30 +1114,40 @@ def build_config(args) -> RuntimeConfig:
         sensor_source=sensor_source,
         sensor_hz=sensor_hz,
         sensor_delay_steps=sensor_delay_steps,
-        imu_angle_bias_rw_std_rad_sqrt_s=float(np.radians(max(args.imu_angle_bias_rw_deg, 0.0))),
-        imu_rate_bias_rw_std_rad_s_sqrt_s=float(max(args.imu_rate_bias_rw, 0.0)),
-        wheel_encoder_bias_rw_std_rad_s_sqrt_s=float(max(args.wheel_rate_bias_rw, 0.0)),
-        base_encoder_pos_bias_rw_std_m_sqrt_s=float(max(args.base_pos_bias_rw, 0.0)),
-        base_encoder_vel_bias_rw_std_m_s_sqrt_s=float(max(args.base_vel_bias_rw, 0.0)),
-        imu_angle_clip_rad=float(np.radians(max(args.imu_angle_clip_deg, 1e-3))),
-        imu_rate_clip_rad_s=float(max(args.imu_rate_clip, 1e-3)),
+        imu_angle_bias_rw_std_rad_sqrt_s=float(np.radians(max(getattr(args, "imu_angle_bias_rw_deg", 0.02), 0.0))),
+        imu_rate_bias_rw_std_rad_s_sqrt_s=float(max(getattr(args, "imu_rate_bias_rw", 0.003), 0.0)),
+        wheel_encoder_bias_rw_std_rad_s_sqrt_s=float(max(getattr(args, "wheel_rate_bias_rw", 0.002), 0.0)),
+        base_encoder_pos_bias_rw_std_m_sqrt_s=float(max(getattr(args, "base_pos_bias_rw", 3e-4), 0.0)),
+        base_encoder_vel_bias_rw_std_m_s_sqrt_s=float(max(getattr(args, "base_vel_bias_rw", 0.004), 0.0)),
+        imu_angle_clip_rad=float(np.radians(max(getattr(args, "imu_angle_clip_deg", 85.0), 1e-3))),
+        imu_rate_clip_rad_s=float(max(getattr(args, "imu_rate_clip", 30.0), 1e-3)),
         wheel_rate_clip_rad_s=float(
-            max(float(args.wheel_rate_clip), 1e-3)
-            if args.wheel_rate_clip is not None
+            max(float(getattr(args, "wheel_rate_clip", None)), 1e-3)
+            if getattr(args, "wheel_rate_clip", None) is not None
             else max(max_wheel_speed_rad_s, 1e-3)
         ),
-        base_pos_clip_m=float(max(args.base_pos_clip, 1e-4)),
-        base_vel_clip_m_s=float(max(args.base_vel_clip, 1e-4)),
-        imu_angle_lpf_hz=float(max(args.imu_angle_lpf_hz, 0.0)),
-        imu_rate_lpf_hz=float(max(args.imu_rate_lpf_hz, 0.0)),
-        wheel_rate_lpf_hz=float(max(args.wheel_rate_lpf_hz, 0.0)),
-        base_pos_lpf_hz=float(max(args.base_pos_lpf_hz, 0.0)),
-        base_vel_lpf_hz=float(max(args.base_vel_lpf_hz, 0.0)),
+        base_pos_clip_m=float(max(getattr(args, "base_pos_clip", 0.75), 1e-4)),
+        base_vel_clip_m_s=float(max(getattr(args, "base_vel_clip", 6.0), 1e-4)),
+        imu_angle_lpf_hz=float(max(getattr(args, "imu_angle_lpf_hz", 45.0), 0.0)),
+        imu_rate_lpf_hz=float(max(getattr(args, "imu_rate_lpf_hz", 70.0), 0.0)),
+        wheel_rate_lpf_hz=float(max(getattr(args, "wheel_rate_lpf_hz", 120.0), 0.0)),
+        base_pos_lpf_hz=float(max(getattr(args, "base_pos_lpf_hz", 25.0), 0.0)),
+        base_vel_lpf_hz=float(max(getattr(args, "base_vel_lpf_hz", 40.0), 0.0)),
         residual_model_path=(str(getattr(args, "residual_model", "")) if getattr(args, "residual_model", None) else None),
         residual_scale=residual_scale,
         residual_max_abs_u=residual_max_abs_u,
         residual_gate_tilt_rad=residual_gate_tilt_rad,
         residual_gate_rate_rad_s=residual_gate_rate_rad_s,
+        dob_enabled=dob_enabled,
+        dob_gain=dob_gain,
+        dob_leak_per_s=dob_leak_per_s,
+        dob_max_abs_u=dob_max_abs_u,
+        gain_schedule_enabled=gain_schedule_enabled,
+        gain_schedule_min=gain_schedule_min,
+        gain_schedule_max=gain_schedule_max,
+        gain_schedule_disturbance_ref=gain_schedule_disturbance_ref,
+        gain_schedule_rate_per_s=gain_schedule_rate_per_s,
+        gain_schedule_weights=gain_schedule_weights,
         max_u=max_u,
         max_du=max_du,
         disturbance_magnitude=disturbance_magnitude,

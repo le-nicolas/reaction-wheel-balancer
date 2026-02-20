@@ -1,3 +1,4 @@
+from pathlib import Path
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -6,7 +7,7 @@ from scipy.linalg import solve_discrete_are
 # ============================================================
 # Load model
 # ============================================================
-model = mujoco.MjModel.from_xml_path("final/final.xml")
+model = mujoco.MjModel.from_xml_path(str(Path(__file__).resolve().parents[3] / "final" / "final.xml"))
 data  = mujoco.MjData(model)
 dt    = model.opt.timestep
 
@@ -234,3 +235,4 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
     print(f"\n=== SIMULATION ENDED ===")
     print(f"Total steps: {step_count}")
     print(f"Max stick angle: {np.degrees(max_angle):.2f}deg")
+

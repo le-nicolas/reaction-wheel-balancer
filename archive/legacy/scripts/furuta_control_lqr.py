@@ -1,3 +1,4 @@
+from pathlib import Path
 import mujoco
 import mujoco.viewer
 import numpy as np
@@ -6,7 +7,7 @@ import time
 # ------------------------------
 # Load model
 # ------------------------------
-model = mujoco.MjModel.from_xml_path("furuta_pendulum2.xml")
+model = mujoco.MjModel.from_xml_path(str(Path(__file__).resolve().parents[1] / "models" / "furuta_pendulum2.xml"))
 data = mujoco.MjData(model)
 
 # Joint indices
@@ -114,3 +115,4 @@ with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as vie
 
         viewer.sync()
         time.sleep(model.opt.timestep)
+

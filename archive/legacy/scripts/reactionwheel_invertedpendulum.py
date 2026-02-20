@@ -1,10 +1,11 @@
+from pathlib import Path
 import mujoco
 import mujoco.viewer
 import numpy as np
 import time
 
 # Load model
-model = mujoco.MjModel.from_xml_path("reactionwheel_invertedpendulum.xml")
+model = mujoco.MjModel.from_xml_path(str(Path(__file__).resolve().parents[1] / "models" / "reactionwheel_invertedpendulum.xml"))
 data = mujoco.MjData(model)
 
 # Small initial angle so it actually falls
@@ -17,3 +18,4 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
         mujoco.mj_step(model, data)
         viewer.sync()
         time.sleep(model.opt.timestep)
+

@@ -1,9 +1,10 @@
+from pathlib import Path
 import mujoco
 import mujoco.viewer
 import numpy as np
 import time
 
-model = mujoco.MjModel.from_xml_path("test.xml")
+model = mujoco.MjModel.from_xml_path(str(Path(__file__).resolve().parents[1] / "models" / "test.xml"))
 data  = mujoco.MjData(model)
 dt = model.opt.timestep
 
@@ -38,3 +39,4 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
         mujoco.mj_step(model, data)
         viewer.sync()
         time.sleep(dt)
+

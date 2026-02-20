@@ -31,6 +31,8 @@ from control_core import (
     base_commands_with_limits,
     compute_control_command,
     reset_controller_buffers,
+    update_disturbance_observer,
+    update_gain_schedule,
     wheel_command_with_limits,
 )
 from residual_model import ResidualPolicy
@@ -154,6 +156,7 @@ def main():
     B = B_full[np.ix_(idx, [ids.aid_rw, ids.aid_base_x, ids.aid_base_y])]
     NX = A.shape[0]
     NU = B.shape[1]
+    B_pinv = np.linalg.pinv(B)
 
     A_aug = np.block([[A, B], [np.zeros((NU, NX)), np.eye(NU)]])
     B_aug = np.vstack([B, np.eye(NU)])
@@ -420,6 +423,23 @@ def main():
         f"rate={cfg.residual_gate_rate_rad_s:.2f}rad/s"
     )
     print(f"residual_status={residual_policy.status}")
+    print("\n=== ADAPTIVE DISTURBANCE OBSERVER ===")
+    print(f"dob_enabled={cfg.dob_enabled}")
+    if cfg.dob_enabled:
+        print(
+            "dob_params: "
+            f"gain={cfg.dob_gain:.2f}/s leak={cfg.dob_leak_per_s:.2f}/s "
+            f"max_abs={cfg.dob_max_abs_u}"
+        )
+    print(f"gain_schedule_enabled={cfg.gain_schedule_enabled}")
+    if cfg.gain_schedule_enabled:
+        print(
+            "gain_schedule: "
+            f"min={cfg.gain_schedule_min:.2f} max={cfg.gain_schedule_max:.2f} "
+            f"ref={cfg.gain_schedule_disturbance_ref:.3f} "
+            f"rate={cfg.gain_schedule_rate_per_s:.2f}/s "
+            f"weights={cfg.gain_schedule_weights}"
+        )
     print(f"Initial Y-direction tilt (roll): {args.initial_y_tilt_deg:.2f} deg")
     print(
         "Payload: "
@@ -436,6 +456,8 @@ def main():
     if cfg.real_hardware_profile:
         base_msg = "enabled" if cfg.allow_base_motion else "disabled (unlock required)"
         print(f"REAL-HARDWARE profile active: strict bring-up limits + forced stop_on_crash + base motion {base_msg}.")
+    if cfg.use_mpc and cfg.dob_enabled:
+        print("Note: DOb/gain scheduling are currently applied on LQR path; MPC mode keeps nominal MPC behavior.")
 
     reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
     if cfg.lock_root_attitude:
@@ -461,6 +483,10 @@ def main():
         high_spin_active,
         cmd_queue,
     ) = reset_controller_buffers(NX, NU, queue_len)
+    dob_hat = np.zeros(NU, dtype=float)
+    dob_raw = np.zeros(NU, dtype=float)
+    dob_prev_x_est = None
+    gain_schedule_scale_state = 1.0
 
     sat_hits = np.zeros(NU, dtype=int)
     du_hits = np.zeros(NU, dtype=int)
@@ -492,6 +518,9 @@ def main():
     residual_clipped_count = 0
     residual_gate_blocked_count = 0
     residual_max_abs = np.zeros(NU, dtype=float)
+    dob_disturbance_level_max = 0.0
+    gain_schedule_scale_max = 1.0
+    gain_schedule_scale_accum = 0.0
     com_planar_dist = compute_robot_com_distance_xy(model, data, ids.base_y_body_id)
     max_com_planar_dist = com_planar_dist
     com_over_support_steps = 0
@@ -535,9 +564,20 @@ def main():
                 "term_safety_shaping_rw",
                 "term_safety_shaping_bx",
                 "term_safety_shaping_by",
+                "term_dob_comp_rw",
+                "term_dob_comp_bx",
+                "term_dob_comp_by",
                 "term_residual_rw",
                 "term_residual_bx",
                 "term_residual_by",
+                "dob_hat_rw",
+                "dob_hat_bx",
+                "dob_hat_by",
+                "dob_raw_rw",
+                "dob_raw_bx",
+                "dob_raw_by",
+                "gain_schedule_scale",
+                "disturbance_level",
                 "wheel_rate",
                 "wheel_rate_abs",
                 "wheel_budget_speed",
@@ -579,6 +619,14 @@ def main():
                 "u_rw",
                 "u_bx",
                 "u_by",
+                "term_dob_comp_rw",
+                "term_dob_comp_bx",
+                "term_dob_comp_by",
+                "dob_hat_rw",
+                "dob_hat_bx",
+                "dob_hat_by",
+                "gain_schedule_scale",
+                "disturbance_level",
                 "payload_mass_kg",
                 "com_planar_dist_m",
                 "com_over_support",
@@ -625,6 +673,10 @@ def main():
                     high_spin_active,
                     cmd_queue,
                 ) = reset_controller_buffers(NX, NU, queue_len)
+                dob_hat[:] = 0.0
+                dob_raw[:] = 0.0
+                dob_prev_x_est = None
+                gain_schedule_scale_state = 1.0
                 reset_sensor_frontend_state(sensor_frontend_state)
                 continue
 
@@ -663,6 +715,33 @@ def main():
                     phase_switch_count += 1
                 if balance_phase == "recovery":
                     recovery_time_s += control_dt
+                disturbance_level = 0.0
+                if cfg.dob_enabled and (not cfg.use_mpc):
+                    dob_hat, dob_raw = update_disturbance_observer(
+                        cfg=cfg,
+                        A=A,
+                        B=B,
+                        B_pinv=B_pinv,
+                        x_prev=dob_prev_x_est,
+                        u_prev=u_eff_applied,
+                        x_curr=x_est,
+                        dob_hat=dob_hat,
+                        control_dt=control_dt,
+                    )
+                    if cfg.gain_schedule_enabled:
+                        gain_schedule_scale_state, disturbance_level = update_gain_schedule(
+                            cfg=cfg,
+                            dob_hat=dob_hat,
+                            gain_schedule_state=gain_schedule_scale_state,
+                            control_dt=control_dt,
+                        )
+                    else:
+                        gain_schedule_scale_state = 1.0
+                        disturbance_level = float(np.linalg.norm(cfg.gain_schedule_weights * dob_hat))
+                else:
+                    dob_hat[:] = 0.0
+                    dob_raw[:] = 0.0
+                    gain_schedule_scale_state = 1.0
                 (
                     u_cmd,
                     base_int,
@@ -694,8 +773,15 @@ def main():
                     K_paper_pitch=K_paper_pitch,
                     du_hits=du_hits,
                     sat_hits=sat_hits,
+                    dob_compensation=dob_hat,
+                    gain_schedule_scale=gain_schedule_scale_state,
+                    disturbance_level=disturbance_level,
                     mpc_controller=mpc_controller,
                 )
+                dob_prev_x_est = x_est.copy()
+                dob_disturbance_level_max = max(dob_disturbance_level_max, disturbance_level)
+                gain_schedule_scale_max = max(gain_schedule_scale_max, gain_schedule_scale_state)
+                gain_schedule_scale_accum += gain_schedule_scale_state
                 residual_step = residual_policy.step(
                     x_est=x_est,
                     x_true=x_true,
@@ -748,9 +834,20 @@ def main():
                             "term_safety_shaping_rw": float(control_terms["term_safety_shaping"][0]),
                             "term_safety_shaping_bx": float(control_terms["term_safety_shaping"][1]),
                             "term_safety_shaping_by": float(control_terms["term_safety_shaping"][2]),
+                            "term_dob_comp_rw": float(control_terms["term_disturbance_comp"][0]),
+                            "term_dob_comp_bx": float(control_terms["term_disturbance_comp"][1]),
+                            "term_dob_comp_by": float(control_terms["term_disturbance_comp"][2]),
                             "term_residual_rw": float(residual_delta[0]),
                             "term_residual_bx": float(residual_delta[1]),
                             "term_residual_by": float(residual_delta[2]),
+                            "dob_hat_rw": float(dob_hat[0]),
+                            "dob_hat_bx": float(dob_hat[1]),
+                            "dob_hat_by": float(dob_hat[2]),
+                            "dob_raw_rw": float(dob_raw[0]),
+                            "dob_raw_bx": float(dob_raw[1]),
+                            "dob_raw_by": float(dob_raw[2]),
+                            "gain_schedule_scale": float(control_terms["gain_schedule_scale"][0]),
+                            "disturbance_level": float(control_terms["disturbance_level"][0]),
                             "wheel_rate": float(x_true[4]),
                             "wheel_rate_abs": float(abs(x_true[4])),
                             "wheel_budget_speed": float(wheel_budget_speed),
@@ -787,6 +884,14 @@ def main():
                             "u_rw": float(u_cmd[0]),
                             "u_bx": float(u_cmd[1]),
                             "u_by": float(u_cmd[2]),
+                            "term_dob_comp_rw": float(control_terms["term_disturbance_comp"][0]),
+                            "term_dob_comp_bx": float(control_terms["term_disturbance_comp"][1]),
+                            "term_dob_comp_by": float(control_terms["term_disturbance_comp"][2]),
+                            "dob_hat_rw": float(dob_hat[0]),
+                            "dob_hat_bx": float(dob_hat[1]),
+                            "dob_hat_by": float(dob_hat[2]),
+                            "gain_schedule_scale": float(control_terms["gain_schedule_scale"][0]),
+                            "disturbance_level": float(control_terms["disturbance_level"][0]),
                             "payload_mass_kg": float(payload_mass_kg),
                             "com_planar_dist_m": float(com_planar_dist),
                             "com_over_support": int(com_planar_dist > cfg.payload_support_radius_m),
@@ -956,6 +1061,10 @@ def main():
                     high_spin_active,
                     cmd_queue,
                 ) = reset_controller_buffers(NX, NU, queue_len)
+                dob_hat[:] = 0.0
+                dob_raw[:] = 0.0
+                dob_prev_x_est = None
+                gain_schedule_scale_state = 1.0
                 reset_sensor_frontend_state(sensor_frontend_state)
                 continue
 
@@ -1007,6 +1116,12 @@ def main():
     )
     print(f"Wheel hard-zone same-direction request count: {wheel_hard_same_dir_request_count}")
     print(f"Wheel hard-zone safe-output count: {wheel_hard_safe_output_count}")
+    if cfg.dob_enabled:
+        print(f"DOb max disturbance level: {dob_disturbance_level_max:.4f}")
+        print(f"DOb final estimate [rw,bx,by]: {dob_hat}")
+    if cfg.gain_schedule_enabled:
+        print(f"Gain schedule max scale: {gain_schedule_scale_max:.3f}")
+        print(f"Gain schedule mean scale: {gain_schedule_scale_accum / denom:.3f}")
     print(f"Residual applied rate [updates]: {residual_applied_count / denom:.3f}")
     print(f"Residual clipped count: {residual_clipped_count}")
     print(f"Residual gate-blocked count: {residual_gate_blocked_count}")

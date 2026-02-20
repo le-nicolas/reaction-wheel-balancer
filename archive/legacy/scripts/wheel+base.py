@@ -1,3 +1,4 @@
+from pathlib import Path
 import time
 
 import mujoco
@@ -17,7 +18,7 @@ def rate_limit(target: float, previous: float, max_rate: float, dt: float) -> fl
 # ----------------------------
 # Load model
 # ----------------------------
-model = mujoco.MjModel.from_xml_path("reactionwheel_basemotor.xml")
+model = mujoco.MjModel.from_xml_path(str(Path(__file__).resolve().parents[1] / "models" / "reactionwheel_basemotor.xml"))
 data = mujoco.MjData(model)
 dt = model.opt.timestep
 
@@ -137,3 +138,4 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
                 f"theta_dot={theta_dot:8.3f}  wheel={wheel_speed:8.2f} rad/s  "
                 f"tau_w={tau_wheel:8.2f}  tau_b={tau_base:7.2f}"
             )
+

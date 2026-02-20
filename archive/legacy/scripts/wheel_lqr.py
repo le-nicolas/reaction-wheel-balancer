@@ -1,3 +1,4 @@
+from pathlib import Path
 import mujoco
 import mujoco.viewer
 import time
@@ -6,7 +7,7 @@ import numpy as np
 # ----------------------------
 # Load MuJoCo model and data
 # ----------------------------
-model = mujoco.MjModel.from_xml_path("wheel_on_stick.xml")
+model = mujoco.MjModel.from_xml_path(str(Path(__file__).resolve().parents[1] / "models" / "wheel_on_stick.xml"))
 data = mujoco.MjData(model)
 
 dt = model.opt.timestep  # simulation timestep
@@ -65,3 +66,4 @@ with mujoco.viewer.launch_passive(model, data) as viewer:
         mujoco.mj_step(model, data)
         viewer.sync()
         time.sleep(dt)
+

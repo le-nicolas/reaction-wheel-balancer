@@ -32,3 +32,9 @@ For conservative bring-up on real hardware, generate with:
 Use `control_loop_safety_check(...)` each outer-loop tick to enforce:
 - command timeout watchdog (`CTRL_CMD_TIMEOUT_US`)
 - tilt trip debounce (`CTRL_TILT_TRIP_COUNT`, `CTRL_CRASH_ANGLE_RAD`)
+
+## Sim-to-Real Process
+
+- Runbook: `docs/SIM_TO_REAL_WORKFLOW.md`
+- Discrepancy log template: `docs/SIM_TO_REAL_DISCREPANCY_LOG.md`
+- Sensitivity analyzer: `final/sim2real_sensitivity.py`

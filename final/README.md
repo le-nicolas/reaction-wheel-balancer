@@ -20,6 +20,9 @@ The goal of this README is to explain:
 | `final/mpc_controller.py` | Constrained MPC solver (OSQP/scipy fallback). |
 | `final/controller_eval.py` | Headless evaluator used by benchmarking/tuning scripts. |
 | `final/benchmark.py` | Reproducible stress benchmark and artifact writer. |
+| `final/sim2real_sensitivity.py` | Ranks model/domain sensitivity from benchmark CSV baselines. |
+| `final/build_residual_dataset.py` | Builds supervised residual dataset from paired baseline/teacher traces. |
+| `final/train_residual_model.py` | Trains residual MLP checkpoint compatible with runtime loader. |
 
 ## 2) How `final.xml` and `final.py` Fit Together
 
@@ -225,6 +228,83 @@ Outputs are written to `final/results/`:
 python final/final.py --use-mpc --mode robust --log-control-terms --control-terms-csv final/results/control_terms_debug.csv --trace-events-csv final/results/runtime_trace_debug.csv
 ```
 
+### 5.5 Sim-to-Real Discrepancy Workflow
+
+Use this process after exporting `controller_params.h` and running hardware bring-up:
+
+1. Generate firmware params with conservative limits.
+```powershell
+python final/export_firmware_params.py --mode robust --real-hardware --out final/firmware/controller_params.h
+```
+2. Confirm parity lock before flashing.
+```powershell
+python -m pytest final/test_export_parity.py -q
+```
+3. Run benchmark with model/domain stress variants and hardware replay trace.
+```powershell
+python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 --trials 0 --controller-families current --model-variants nominal,inertia_plus,inertia_minus,friction_low,friction_high,com_shift --domain-rand-profile default,rand_light,rand_medium,rand_heavy --compare-modes default-vs-low-spin-robust --primary-objective balanced --hardware-trace-path path/to/hardware_trace.csv
+```
+4. Generate sensitivity ranking from the benchmark CSV.
+```powershell
+python final/sim2real_sensitivity.py --csv final/results/benchmark_<timestamp>.csv
+```
+5. Record findings in:
+`docs/SIM_TO_REAL_DISCREPANCY_LOG.md`
+
+Full runbook:
+`docs/SIM_TO_REAL_WORKFLOW.md`
+
+### 5.6 Residual Model Workflow
+
+Runtime behavior:
+
+1. Residual model input is `x_est[9] + u_eff_applied[3] + u_nominal[3]` (15 features).
+2. Output is additive `delta_u[3]`.
+3. `--residual-scale` multiplies residual amplitude before final per-axis clipping.
+
+Data/build/train path:
+
+1. Capture paired baseline and teacher traces (same seed/disturbance):
+```powershell
+python final/final.py --mode robust --controller-family current --seed 12345 --trace-events-csv final/results/trace_baseline.csv
+python final/final.py --mode robust --controller-family hybrid_modern --seed 12345 --trace-events-csv final/results/trace_teacher.csv
+```
+2. Build dataset:
+```powershell
+python final/build_residual_dataset.py --baseline-trace final/results/trace_baseline.csv --teacher-trace final/results/trace_teacher.csv --out final/results/residual_dataset.npz
+```
+3. Train checkpoint:
+```powershell
+python final/train_residual_model.py --dataset final/results/residual_dataset.npz --out final/results/residual.pt --epochs 50 --batch-size 1024 --hidden-dim 32 --hidden-layers 2
+```
+4. Evaluate:
+```powershell
+python final/final.py --mode robust --residual-model final/results/residual.pt --residual-scale 0.20 --log-control-terms --trace-events-csv final/results/trace_residual_eval.csv
+```
+
+Detailed guide:
+`docs/RESIDUAL_MODEL_GUIDE.md`
+
+### 5.7 Adaptive Disturbance Observer + Gain Scheduling
+
+This feature is optional and targets LQR mode (`--use-mpc` off):
+
+1. Disturbance observer estimates unknown additive input disturbances in actuator space (`rw`, `bx`, `by`).
+2. Compensation term subtracts that estimate from the command.
+3. Gain scheduling scales stabilization gains up under large estimated disturbance and back down in calm state.
+
+Example:
+
+```powershell
+python final/final.py --mode robust --enable-dob --dob-gain 14 --dob-leak-per-s 0.6 --dob-max-rw 6.0 --dob-max-bx 1.0 --dob-max-by 1.0 --enable-gain-scheduling --gain-sched-min 1.0 --gain-sched-max 1.8 --gain-sched-ref 2.0 --gain-sched-rate-per-s 3.0
+```
+
+For tuning visibility, run with:
+
+```powershell
+python final/final.py --mode robust --enable-dob --enable-gain-scheduling --log-control-terms --trace-events-csv final/results/runtime_trace_dob.csv
+```
+
 ## 6) Rebuild From Scratch (Recommended Path)
 
 If someone wants to recreate this project from zero, use this exact sequence.
@@ -300,6 +380,13 @@ python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 
 
 # Export firmware-friendly controller header
 python final/export_firmware_params.py --mode robust --out final/firmware/controller_params.h
+
+# Rank sensitivity factors from a benchmark CSV
+python final/sim2real_sensitivity.py --csv final/results/benchmark_<timestamp>.csv
+
+# Build and train residual model from paired traces
+python final/build_residual_dataset.py --baseline-trace final/results/trace_baseline.csv --teacher-trace final/results/trace_teacher.csv --out final/results/residual_dataset.npz
+python final/train_residual_model.py --dataset final/results/residual_dataset.npz --out final/results/residual.pt
 ```
 
 ---

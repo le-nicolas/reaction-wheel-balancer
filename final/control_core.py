@@ -135,7 +135,10 @@ def _init_control_terms() -> dict[str, np.ndarray]:
         "term_despin": np.zeros(3, dtype=float),
         "term_base_hold": np.zeros(3, dtype=float),
         "term_safety_shaping": np.zeros(3, dtype=float),
+        "term_disturbance_comp": np.zeros(3, dtype=float),
         "term_mpc": np.zeros(3, dtype=float),
+        "gain_schedule_scale": np.array([1.0], dtype=float),
+        "disturbance_level": np.array([0.0], dtype=float),
     }
 
 
@@ -144,6 +147,78 @@ def _fuzzy_roll_gain(cfg: RuntimeConfig, roll: float, roll_rate: float) -> float
     rate_n = abs(roll_rate) / max(cfg.hold_exit_rate_rad_s, 1e-6)
     level = float(np.clip(0.65 * roll_n + 0.35 * rate_n, 0.0, 1.0))
     return 0.35 + 0.95 * level
+
+
+def update_disturbance_observer(
+    cfg: RuntimeConfig,
+    A: np.ndarray,
+    B: np.ndarray,
+    B_pinv: np.ndarray,
+    x_prev: np.ndarray | None,
+    u_prev: np.ndarray,
+    x_curr: np.ndarray,
+    dob_hat: np.ndarray,
+    control_dt: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if (not cfg.dob_enabled) or x_prev is None:
+        return dob_hat, np.zeros(3, dtype=float)
+    x_model = A @ x_prev + B @ u_prev
+    state_residual = x_curr - x_model
+    d_raw = B_pinv @ state_residual
+    if (d_raw.shape[0] != 3) or (not np.all(np.isfinite(d_raw))):
+        return np.zeros(3, dtype=float), np.zeros(3, dtype=float)
+
+    alpha = float(np.clip(cfg.dob_gain * control_dt, 0.0, 1.0))
+    dob_next = (1.0 - alpha) * dob_hat + alpha * d_raw
+    leak = float(np.clip(cfg.dob_leak_per_s * control_dt, 0.0, 1.0))
+    dob_next *= (1.0 - leak)
+    dob_next = np.clip(dob_next, -cfg.dob_max_abs_u, cfg.dob_max_abs_u)
+    if not np.all(np.isfinite(dob_next)):
+        return np.zeros(3, dtype=float), np.zeros(3, dtype=float)
+    return dob_next.astype(float, copy=False), d_raw.astype(float, copy=False)
+
+
+def update_gain_schedule(
+    cfg: RuntimeConfig,
+    dob_hat: np.ndarray,
+    gain_schedule_state: float,
+    control_dt: float,
+) -> tuple[float, float]:
+    if not cfg.gain_schedule_enabled:
+        return 1.0, 0.0
+    weights = np.asarray(cfg.gain_schedule_weights, dtype=float)
+    if weights.shape[0] != 3:
+        weights = np.ones(3, dtype=float)
+    disturbance_level = float(np.linalg.norm(weights * np.asarray(dob_hat, dtype=float)))
+    level_norm = float(np.clip(disturbance_level / max(cfg.gain_schedule_disturbance_ref, 1e-6), 0.0, 1.0))
+    target = float(cfg.gain_schedule_min + (cfg.gain_schedule_max - cfg.gain_schedule_min) * level_norm)
+    rate = float(max(cfg.gain_schedule_rate_per_s, 0.0))
+    if np.isfinite(rate) and rate > 0.0:
+        max_step = rate * control_dt
+        next_scale = float(gain_schedule_state + np.clip(target - gain_schedule_state, -max_step, max_step))
+    else:
+        next_scale = float(target)
+    next_scale = float(np.clip(next_scale, cfg.gain_schedule_min, cfg.gain_schedule_max))
+    return next_scale, disturbance_level
+
+
+def _apply_dob_compensation(
+    cfg: RuntimeConfig,
+    u_cmd: np.ndarray,
+    sat_hits: np.ndarray,
+    terms: dict[str, np.ndarray],
+    dob_compensation: np.ndarray | None,
+) -> np.ndarray:
+    if (not cfg.dob_enabled) or dob_compensation is None:
+        return u_cmd
+    dob = np.asarray(dob_compensation, dtype=float).reshape(-1)
+    if dob.size != 3 or (not np.all(np.isfinite(dob))):
+        return u_cmd
+    comp = -dob
+    terms["term_disturbance_comp"] = comp.astype(float, copy=False)
+    u_comp = u_cmd + comp
+    sat_hits += (np.abs(u_comp) > cfg.max_u).astype(int)
+    return np.clip(u_comp, -cfg.max_u, cfg.max_u)
 
 
 def compute_control_command(
@@ -165,12 +240,22 @@ def compute_control_command(
     K_paper_pitch: np.ndarray | None,
     du_hits: np.ndarray,
     sat_hits: np.ndarray,
+    dob_compensation: np.ndarray | None = None,
+    gain_schedule_scale: float = 1.0,
+    disturbance_level: float = 0.0,
     mpc_controller: "MPCController | None" = None,
 ):
     """Controller core: delta-u LQR + wheel-only mode + base policy + safety shaping."""
     wheel_over_budget = False
     wheel_over_hard = False
     terms = _init_control_terms()
+    schedule_scale = (
+        float(np.clip(gain_schedule_scale, cfg.gain_schedule_min, cfg.gain_schedule_max))
+        if cfg.gain_schedule_enabled
+        else 1.0
+    )
+    terms["gain_schedule_scale"][0] = schedule_scale
+    terms["disturbance_level"][0] = float(max(disturbance_level, 0.0))
     x_ctrl = x_est.copy()
     x_ctrl[5] -= cfg.x_ref
     x_ctrl[6] -= cfg.y_ref
@@ -376,6 +461,8 @@ def compute_control_command(
     # saturation/delay/motor limits differ from requested command.
     z = np.concatenate([x_ctrl, u_eff_applied])
     du_lqr = -K_du @ z
+    if not cfg.use_mpc:
+        du_lqr *= schedule_scale
     terms["term_lqr_core"] = np.array([du_lqr[0], du_lqr[1], du_lqr[2]], dtype=float)
 
     # Literature-style benchmark comparator:
@@ -391,6 +478,8 @@ def compute_control_command(
         s_roll = float(x_est[1] + lam_roll * x_est[3])
         k_fuzzy = _fuzzy_roll_gain(cfg, float(x_est[1]), float(x_est[3]))
         u_roll_sm = float(-k_fuzzy * np.tanh(s_roll / phi) * 0.45 * cfg.max_u[0])
+        u_pitch *= schedule_scale
+        u_roll_sm *= schedule_scale
 
         terms["term_pitch_stability"][0] = u_pitch
         terms["term_roll_stability"][0] = u_roll_sm
@@ -410,6 +499,8 @@ def compute_control_command(
         if cfg.allow_base_motion:
             balance_x = cfg.base_command_gain * (cfg.base_pitch_kp * x_est[0] + cfg.base_pitch_kd * x_est[2])
             balance_y = -cfg.base_command_gain * (cfg.base_roll_kp * x_est[1] + cfg.base_roll_kd * x_est[3])
+            balance_x *= schedule_scale
+            balance_y *= schedule_scale
             # Roll sliding compensation influences base y to emulate split-channel behavior.
             balance_y += float(-0.25 * np.sign(s_roll) * cfg.max_u[2] * np.tanh(abs(s_roll) / phi))
             terms["term_pitch_stability"][1] = balance_x
@@ -429,6 +520,7 @@ def compute_control_command(
             u_base_smooth[:] = 0.0
 
         u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
+        u_cmd = _apply_dob_compensation(cfg, u_cmd, sat_hits, terms, dob_compensation)
         if cfg.hardware_safe:
             terms["term_safety_shaping"][1:] += u_cmd[1:] * (-0.75)
             u_cmd[1:] = np.clip(0.25 * u_cmd[1:], -0.35, 0.35)
@@ -449,6 +541,7 @@ def compute_control_command(
     if cfg.wheel_only:
         xw = np.array([x_est[0], x_est[2], x_est[4]], dtype=float)
         u_rw_target = float(-(K_wheel_only @ xw)[0])
+        u_rw_target *= schedule_scale
         wheel_pitch_int = float(
             np.clip(
                 wheel_pitch_int + x_est[0] * control_dt,
@@ -472,6 +565,8 @@ def compute_control_command(
         if cfg.controller_family == "hybrid_modern":
             pitch_stab = float(-(0.12 * cfg.base_pitch_kp) * x_est[0] - (0.10 * cfg.base_pitch_kd) * x_est[2])
             roll_stab = float((0.06 * cfg.base_roll_kp) * x_est[1] + (0.06 * cfg.base_roll_kd) * x_est[3])
+            pitch_stab *= schedule_scale
+            roll_stab *= schedule_scale
             du_rw_cmd += pitch_stab + roll_stab
             terms["term_pitch_stability"][0] += pitch_stab
             terms["term_roll_stability"][0] += roll_stab
@@ -605,6 +700,8 @@ def compute_control_command(
         terms["term_base_hold"][1:] = np.array([hold_x, hold_y], dtype=float)
         balance_x = cfg.base_command_gain * (cfg.base_pitch_kp * x_est[0] + cfg.base_pitch_kd * x_est[2])
         balance_y = -cfg.base_command_gain * (cfg.base_roll_kp * x_est[1] + cfg.base_roll_kd * x_est[3])
+        balance_x *= schedule_scale
+        balance_y *= schedule_scale
         terms["term_pitch_stability"][1] = balance_x
         terms["term_roll_stability"][2] = balance_y
         if cfg.controller_family == "hybrid_modern":
@@ -661,6 +758,7 @@ def compute_control_command(
         u_base_smooth[:] = 0.0
 
     u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
+    u_cmd = _apply_dob_compensation(cfg, u_cmd, sat_hits, terms, dob_compensation)
     if cfg.hardware_safe:
         terms["term_safety_shaping"][1:] += u_cmd[1:] * (-0.75)
         u_cmd[1:] = np.clip(0.25 * u_cmd[1:], -0.35, 0.35)

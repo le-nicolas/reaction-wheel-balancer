@@ -6,6 +6,15 @@ It is written for two audiences:
 - non-technical readers who want to understand what this project proves
 - technical readers who want to reproduce, inspect, and extend the control stack
 
+## 0) Repository Layout
+
+- `final/`: active simulator, controller runtime, firmware export, and benchmark tooling.
+- `meshes/`: shared geometry assets.
+- `docs/`: workflow and analysis documentation.
+- `archive/`: legacy prototypes and historical logs moved out of the root.
+- `web/`: browser viewer side quest.
+- `wheel-base-controller-release/`: standalone minimal wheel+base package snapshot.
+
 ## 1) Non-Technical Overview
 
 ### What this project does
@@ -86,6 +95,7 @@ python final/plot_paper_vs_sim.py --csv final/results/benchmark_20260216_011044.
 Runtime stack:
 - state estimation: linear Kalman correction from noisy channels
 - control core: delta-u LQR with controller-family-specific shaping
+- optional adaptive disturbance observer + gain scheduling: estimate unknown additive disturbances and scale stabilizing gains in real time
 - optional residual correction: offline PyTorch model adds bounded `delta_u` to nominal command
 - safety shaping: saturation and rate limits, wheel-speed budget/high-spin logic, strict hard-speed same-direction suppression, base-authority gating, crash-angle handling
 
@@ -175,6 +185,8 @@ Optional residual correction run:
 ```bash
 python final/final.py --mode smooth --residual-model path/to/residual.pt --residual-scale 0.20
 ```
+Training and deployment details:
+- `docs/RESIDUAL_MODEL_GUIDE.md`
 
 Web side quest (Brave):
 ```bash
@@ -197,6 +209,9 @@ Files:
 - `final/firmware/README.md`
 - `final/export_firmware_params.py`
 - `final/test_export_parity.py`
+- `docs/SIM_TO_REAL_WORKFLOW.md`
+- `docs/SIM_TO_REAL_DISCREPANCY_LOG.md`
+- `final/sim2real_sensitivity.py`
 
 ### 2.7 Project map
 
@@ -204,8 +219,11 @@ Files:
 - MuJoCo model: `final/final.xml`
 - Evaluator: `final/controller_eval.py`
 - Benchmark driver: `final/benchmark.py`
+- Sim-to-real sensitivity summarizer: `final/sim2real_sensitivity.py`
 - Paper-vs-sim graph generator: `final/plot_paper_vs_sim.py`
 - Final folder guide: `final/README.md`
+- Documentation index: `docs/README.md`
+- Legacy archive index: `archive/README.md`
 
 ### 2.8 Limitations
 
