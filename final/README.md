@@ -453,6 +453,33 @@ To make the comparison tighter in future work:
 - Contact/friction/sensor models are approximations.
 - Real hardware requires calibration, safety interlocks, and staged testing.
 
+## 13) Architecture Ceiling (Decision)
+
+Yes: this architecture has reached its practical ceiling for the current plant.
+
+What is complete:
+- Root cause identified: marginally stable integrator poles (`lambda = 1.0`) create unavoidable long-horizon drift.
+- MPC implemented with hard constraints and integrated into the production control stack.
+- Long-run validation completed (multi-million-step campaigns) with clear documentation.
+
+Why further controller-only tuning will not remove crashes:
+- Two poles at `lambda = 1.0` mean no natural decay of drift.
+- COM support radius is a hard geometric boundary (`0.145 m`) that drift eventually reaches.
+- Even with good sensing, model mismatch/discretization/noise still accumulate over long horizons.
+- Similar long-run crash behavior under both LQR and MPC indicates a plant-limited regime, not a single-controller failure.
+
+If lower crash rate is required from here, the next moves are plant-level:
+- Increase support radius (larger footprint / stability margin).
+- Add an online disturbance observer (explicit drift estimation and compensation).
+- Redesign inertia/geometry to move closed-loop dominant modes away from the marginal boundary.
+- Add a hybrid landing/degrade mode near COM boundary.
+- Improve sensing/estimation stack for earlier drift detection.
+
+Conclusion:
+- Current MPC implementation is working as intended.
+- Remaining residual crash floor is physics-limited for this plant configuration.
+- This design is ready to ship within the stated claim boundaries.
+
 ---
 
 If you only read one file first, read `final/README.md` (this file), then open `final/final.py` and `final/final.xml` side-by-side.
