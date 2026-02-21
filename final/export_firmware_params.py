@@ -10,8 +10,38 @@ from scipy.linalg import solve_discrete_are
 import final as runtime
 
 
+def _solve_discrete_are_robust(a: np.ndarray, b: np.ndarray, q: np.ndarray, r: np.ndarray, label: str) -> np.ndarray:
+    reg_steps = (0.0, 1e-12, 1e-10, 1e-8, 1e-6)
+    eye = np.eye(r.shape[0], dtype=float)
+    last_exc: Exception | None = None
+    for eps in reg_steps:
+        try:
+            p = solve_discrete_are(a, b, q, r + eps * eye)
+            if np.all(np.isfinite(p)):
+                return 0.5 * (p + p.T)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    raise RuntimeError(f"{label} DARE failed after regularization fallback: {last_exc}") from last_exc
+
+
+def _solve_linear_robust(gram: np.ndarray, rhs: np.ndarray, label: str) -> np.ndarray:
+    try:
+        return np.linalg.solve(gram, rhs)
+    except np.linalg.LinAlgError:
+        sol, *_ = np.linalg.lstsq(gram, rhs, rcond=None)
+        if not np.all(np.isfinite(sol)):
+            raise RuntimeError(f"{label} linear solve returned non-finite result.")
+        return sol
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export controller/estimator params as deterministic C header.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Optional runtime tuning YAML file (defaults to final/config.yaml when present).",
+    )
     parser.add_argument("--mode", choices=["smooth", "robust"], default="smooth")
     parser.add_argument(
         "--real-hardware",
@@ -123,8 +153,6 @@ def linearize_model(model: mujoco.MjModel, data: mujoco.MjData) -> tuple[np.ndar
 
     q_pitch = model.jnt_qposadr[jid_pitch]
     q_roll = model.jnt_qposadr[jid_roll]
-    q_base_x = model.jnt_qposadr[jid_base_x]
-    q_base_y = model.jnt_qposadr[jid_base_y]
 
     v_pitch = model.jnt_dofadr[jid_pitch]
     v_roll = model.jnt_dofadr[jid_roll]
@@ -138,22 +166,22 @@ def linearize_model(model: mujoco.MjModel, data: mujoco.MjData) -> tuple[np.ndar
 
     runtime.reset_state(model, data, q_pitch, q_roll)
 
-    nx = model.nq + model.nv
+    nx = 2 * model.nv + model.na
     nu = model.nu
     a_full = np.zeros((nx, nx))
     b_full = np.zeros((nx, nu))
     mujoco.mjd_transitionFD(model, data, 1e-6, True, a_full, b_full, None, None)
 
     idx = [
-        q_pitch,
-        q_roll,
-        model.nq + v_pitch,
-        model.nq + v_roll,
-        model.nq + v_rw,
-        q_base_x,
-        q_base_y,
-        model.nq + v_base_x,
-        model.nq + v_base_y,
+        v_pitch,
+        v_roll,
+        model.nv + v_pitch,
+        model.nv + v_roll,
+        model.nv + v_rw,
+        v_base_x,
+        v_base_y,
+        model.nv + v_base_x,
+        model.nv + v_base_y,
     ]
     a = a_full[np.ix_(idx, idx)]
     b = b_full[np.ix_(idx, [aid_rw, aid_base_x, aid_base_y])]
@@ -173,8 +201,12 @@ def compute_export_bundle(args: argparse.Namespace) -> dict[str, Any]:
     a_aug = np.block([[a, b], [np.zeros((nu, nx)), np.eye(nu)]])
     b_aug = np.vstack([b, np.eye(nu)])
     q_aug = np.block([[cfg.qx, np.zeros((nx, nu))], [np.zeros((nu, nx)), cfg.qu]])
-    p_aug = solve_discrete_are(a_aug, b_aug, q_aug, cfg.r_du)
-    k_du = np.linalg.inv(b_aug.T @ p_aug @ b_aug + cfg.r_du) @ (b_aug.T @ p_aug @ a_aug)
+    p_aug = _solve_discrete_are_robust(a_aug, b_aug, q_aug, cfg.r_du, label="Export controller")
+    k_du = _solve_linear_robust(
+        b_aug.T @ p_aug @ b_aug + cfg.r_du,
+        b_aug.T @ p_aug @ a_aug,
+        label="Export controller gain",
+    )
 
     c = runtime.build_partial_measurement_matrix(cfg)
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))

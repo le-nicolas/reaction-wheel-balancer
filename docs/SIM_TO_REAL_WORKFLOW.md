@@ -14,6 +14,7 @@ Run parity tests before flashing:
 
 ```powershell
 python -m pytest final/test_export_parity.py -q
+python -m pytest final/test_firmware_scenario_parity.py -q
 ```
 
 ## 2) Firmware Bring-Up (ESP32)
@@ -82,7 +83,7 @@ For every hardware session, fill in:
 
 Minimum acceptance gates before promoting tuning changes:
 
-1. Parity test passes (`final/test_export_parity.py`).
+1. Parity tests pass (`final/test_export_parity.py`, `final/test_firmware_scenario_parity.py`).
 2. Replay metrics satisfy your thresholds.
 3. No new safety latch regressions.
 4. Sensitivity summary does not show uncontrolled degradation on high-risk factors.

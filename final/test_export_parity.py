@@ -3,7 +3,6 @@ import unittest
 
 import mujoco
 import numpy as np
-from scipy.linalg import solve_discrete_are
 
 import export_firmware_params as export
 import final as runtime
@@ -22,8 +21,12 @@ def reference_bundle(args: argparse.Namespace):
     a_aug = np.block([[a, b], [np.zeros((nu, nx)), np.eye(nu)]])
     b_aug = np.vstack([b, np.eye(nu)])
     q_aug = np.block([[cfg.qx, np.zeros((nx, nu))], [np.zeros((nu, nx)), cfg.qu]])
-    p_aug = solve_discrete_are(a_aug, b_aug, q_aug, cfg.r_du)
-    k_du = np.linalg.inv(b_aug.T @ p_aug @ b_aug + cfg.r_du) @ (b_aug.T @ p_aug @ a_aug)
+    p_aug = export._solve_discrete_are_robust(a_aug, b_aug, q_aug, cfg.r_du, label="Reference controller")
+    k_du = export._solve_linear_robust(
+        b_aug.T @ p_aug @ b_aug + cfg.r_du,
+        b_aug.T @ p_aug @ a_aug,
+        label="Reference controller gain",
+    )
 
     c = runtime.build_partial_measurement_matrix(cfg)
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))

@@ -16,6 +16,7 @@ The goal of this README is to explain:
 | `final/final.py` | Runtime loop: parse config, linearize model, estimate state, compute control, apply safety, simulate/render. |
 | `final/control_core.py` | Main control law and safety shaping (LQR path and MPC path). |
 | `final/runtime_config.py` | All runtime parameters and CLI flags. |
+| `final/config.yaml` | Central tuning file for wheel/base saturation policy and other runtime overrides. |
 | `final/runtime_model.py` | Model IDs, reset logic, estimator, COM distance checks, root-attitude clamp helpers. |
 | `final/mpc_controller.py` | Constrained MPC solver (OSQP/scipy fallback). |
 | `final/controller_eval.py` | Headless evaluator used by benchmarking/tuning scripts. |
@@ -201,6 +202,11 @@ Optional:
 
 1. `pip install torch` if you want residual model support.
 
+Runtime tuning:
+
+1. `final/config.yaml` is auto-loaded when present.
+2. Override with `--config path/to/config.yaml`.
+
 ### 5.2 Run Interactive Viewer
 
 ```powershell
@@ -239,6 +245,7 @@ python final/export_firmware_params.py --mode robust --real-hardware --out final
 2. Confirm parity lock before flashing.
 ```powershell
 python -m pytest final/test_export_parity.py -q
+python -m pytest final/test_firmware_scenario_parity.py -q
 ```
 3. Run benchmark with model/domain stress variants and hardware replay trace.
 ```powershell

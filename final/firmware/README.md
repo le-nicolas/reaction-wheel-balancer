@@ -29,6 +29,10 @@ Faults are latched and require explicit re-arm/reset:
 For conservative bring-up on real hardware, generate with:
 `python final/export_firmware_params.py --mode robust --real-hardware --out final/firmware/controller_params.h`
 
+Before flashing, run:
+- `python -m pytest final/test_export_parity.py -q`
+- `python -m pytest final/test_firmware_scenario_parity.py -q`
+
 Use `control_loop_safety_check(...)` each outer-loop tick to enforce:
 - command timeout watchdog (`CTRL_CMD_TIMEOUT_US`)
 - tilt trip debounce (`CTRL_TILT_TRIP_COUNT`, `CTRL_CRASH_ANGLE_RAD`)

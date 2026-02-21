@@ -4,6 +4,9 @@ This side quest runs the **full Python controller stack from `final/final.py`** 
 and streams live state to a Three.js renderer in the browser.
 You change payload mass, reset, and observe whether it stabilizes or fails from overload.
 
+Implementation note:
+- This is a live runtime integration (not a static mock page), using HTTP API polling (`/api/state`) rather than WebSockets.
+
 ## Target Browser
 
 - Brave (latest desktop)

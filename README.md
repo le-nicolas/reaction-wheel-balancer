@@ -9,6 +9,7 @@
 - Maturity: active development and benchmarking, not a frozen release.
 - Primary code path: `final/`.
 - Ground truth for claims: saved benchmark artifacts in `final/results/`.
+- CI path: `.github/workflows/ci.yml` runs parity tests plus a fast benchmark smoke profile on push/PR.
 
 This repository is a simulation-first control project for a balancing robot with a reaction wheel and a moving base.
 
@@ -30,7 +31,7 @@ It is written for two audiences:
 - This repo is an active research/dev sandbox, not a frozen release.
 - The only actively maintained control stack is under `final/`.
 - Historical files/prototypes are retained in `archive/` for traceability, not as recommended entry points.
-- The benchmark table in this README (`2026-02-16` snapshot) is a reproducible reference point, not a claim that all newer stress cases are solved.
+- The benchmark table in this README (`2026-02-21` snapshot) is a reproducible reference point, not a claim that all newer stress cases are solved.
 - Recent fixed-seed stress diagnostics (`seed=42`, 80 episodes, high disturbance profile) are stored in:
   - `final/results/throughput_ablation_seed42.json`
   - `final/results/throughput_ablation_seed42_extra.json`
@@ -120,7 +121,7 @@ Runtime stack:
 - control core: delta-u LQR with controller-family-specific shaping
 - optional adaptive disturbance observer + gain scheduling: estimate unknown additive disturbances and scale stabilizing gains in real time
 - optional residual correction: offline PyTorch model adds bounded `delta_u` to nominal command
-- safety shaping: saturation and rate limits, wheel-speed budget/high-spin logic, strict hard-speed same-direction suppression, base-authority gating, crash-angle handling
+- safety shaping: saturation and rate limits, wheel-speed budget/high-spin logic, strict hard-speed same-direction suppression, base-authority gating, crash-angle handling (centrally tunable in `final/config.yaml`)
 
 Why recent IMU/sensor realism changes were added:
 - avoid overfitting to idealized state feedback
@@ -138,31 +139,34 @@ General effect:
 - `current`
 - `hybrid_modern`
 - `paper_split_baseline`
-- `baseline_mpc`
+- `baseline_mpc` (reference constrained-MPC baseline, intentionally kept without low-spin hardening add-ons)
 - `baseline_robust_hinf_like`
 
-### 2.3 Benchmark snapshot (2026-02-16)
+### 2.3 Benchmark snapshot (2026-02-21)
 
 Canonical artifacts:
-- `final/results/benchmark_20260216_011044_summary.txt`
-- `final/results/benchmark_20260216_011044.csv`
-- `final/results/benchmark_20260216_011044_protocol.json`
+- `final/results/benchmark_20260221_100424_summary.txt`
+- `final/results/benchmark_20260221_100424.csv`
+- `final/results/benchmark_20260221_100424_protocol.json`
 
 Mode shown below: `mode_default / nominal / default`
 
 | Controller | Survival | Crash rate | Composite score |
 |---|---:|---:|---:|
-| `baseline_robust_hinf_like` | 1.000 | 0.000 | 75.457 |
-| `hybrid_modern` | 1.000 | 0.000 | 74.460 |
-| `current` | 1.000 | 0.000 | 73.993 |
-| `paper_split_baseline` | 1.000 | 0.000 | 72.913 |
-| `baseline_mpc` | 0.625 | 0.375 | 37.837 |
+| `baseline_mpc` | 1.000 | 0.000 | 86.793 |
+| `current` | 1.000 | 0.000 | 81.862 |
+| `hybrid_modern` | 1.000 | 0.000 | 80.727 |
+| `baseline_robust_hinf_like` | 1.000 | 0.000 | 80.232 |
+| `paper_split_baseline` | 1.000 | 0.000 | 69.169 |
+
+`baseline_mpc` is still a comparator baseline, not the default deployment path.
+Longer and harsher profiles can still separate controllers even when this fast smoke profile passes for all families.
 
 ### 2.4 Reproducibility
 
 Benchmark command used for this snapshot:
 ```bash
-python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 3000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
+python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 2000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
 ```
 
 Expected outputs:
@@ -211,11 +215,14 @@ python final/final.py --mode smooth --residual-model path/to/residual.pt --resid
 Training and deployment details:
 - `docs/RESIDUAL_MODEL_GUIDE.md`
 
-Web side quest (Brave):
+Central runtime tuning file:
+- `final/config.yaml` (auto-loaded when present; override with `--config path/to/config.yaml`)
+
+Web side quest (Brave, live runtime-connected):
 ```bash
-python -m http.server 8080
+python web/server.py --port 8090
 ```
-Open `http://localhost:8080/web/` and use the payload mass controls.
+Open `http://localhost:8090/web/` and use the payload mass controls.
 
 Wheel-spin diagnostics:
 - runtime summary now reports signed wheel speed peaks, mean absolute wheel speed, over-budget/over-hard ratios (total and sign-split), and hard-zone suppression counters for tuning.
@@ -232,6 +239,7 @@ Files:
 - `final/firmware/README.md`
 - `final/export_firmware_params.py`
 - `final/test_export_parity.py`
+- `final/test_firmware_scenario_parity.py`
 - `docs/SIM_TO_REAL_WORKFLOW.md`
 - `docs/SIM_TO_REAL_DISCREPANCY_LOG.md`
 - `final/sim2real_sensitivity.py`

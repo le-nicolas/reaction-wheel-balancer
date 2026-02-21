@@ -1,7 +1,166 @@
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import numpy as np
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - optional dependency in some environments
+    yaml = None
+
+
+DEFAULT_RUNTIME_CONFIG_PATH = Path(__file__).with_name("config.yaml")
+TUNABLE_KEYS = {
+    "qx_diag",
+    "qu_diag",
+    "r_du_diag",
+    "max_u",
+    "max_du",
+    "ki_base",
+    "u_bleed",
+    "wheel_momentum_thresh_frac",
+    "wheel_momentum_k",
+    "wheel_momentum_upright_k",
+    "wheel_spin_budget_frac",
+    "wheel_spin_hard_frac",
+    "wheel_spin_budget_abs_rad_s",
+    "wheel_spin_hard_abs_rad_s",
+    "high_spin_exit_frac",
+    "high_spin_counter_min_frac",
+    "high_spin_base_authority_min",
+    "wheel_to_base_bias_gain",
+    "recovery_wheel_despin_scale",
+    "hold_wheel_despin_scale",
+    "base_force_soft_limit",
+    "base_damping_gain",
+    "base_centering_gain",
+    "base_tilt_deadband_deg",
+    "base_tilt_full_authority_deg",
+    "base_command_gain",
+    "base_centering_pos_clip_m",
+    "base_speed_soft_limit_frac",
+    "base_hold_radius_m",
+    "base_ref_follow_rate_hz",
+    "base_ref_recenter_rate_hz",
+    "base_authority_rate_per_s",
+    "base_command_lpf_hz",
+    "upright_base_du_scale",
+    "base_pitch_kp",
+    "base_pitch_kd",
+    "base_roll_kp",
+    "base_roll_kd",
+    "wheel_only_pitch_kp",
+    "wheel_only_pitch_kd",
+    "wheel_only_pitch_ki",
+    "wheel_only_wheel_rate_kd",
+    "wheel_only_max_u",
+    "wheel_only_max_du",
+}
+
+
+def _merge_tunable_block(target: dict[str, Any], block: Any, label: str) -> None:
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ValueError(f"Runtime config block '{label}' must be a mapping.")
+    for key, value in block.items():
+        if key in TUNABLE_KEYS:
+            target[key] = value
+
+
+def _parse_tuning_file(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        return {}
+    if yaml is None:
+        raise RuntimeError(
+            f"Runtime tuning file '{path}' requires PyYAML. Install with: pip install pyyaml"
+        )
+    loaded = yaml.safe_load(text)
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError(f"Runtime tuning file '{path}' must define a mapping at top level.")
+    return loaded
+
+
+def _resolve_runtime_tuning_overrides(
+    config_path_arg: str | None,
+    *,
+    mode: str,
+    preset: str,
+    stability_profile: str,
+) -> dict[str, Any]:
+    cfg_path = Path(config_path_arg).expanduser() if config_path_arg else DEFAULT_RUNTIME_CONFIG_PATH
+    if not cfg_path.exists():
+        return {}
+    data = _parse_tuning_file(cfg_path)
+    merged: dict[str, Any] = {}
+
+    # Backward-compatible: allow top-level direct tunables.
+    _merge_tunable_block(merged, data, "top_level")
+    _merge_tunable_block(merged, data.get("global"), "global")
+
+    mode_map = data.get("mode")
+    if isinstance(mode_map, dict):
+        _merge_tunable_block(merged, mode_map.get(mode), f"mode.{mode}")
+
+    preset_map = data.get("preset")
+    if isinstance(preset_map, dict):
+        _merge_tunable_block(merged, preset_map.get(preset), f"preset.{preset}")
+
+    stability_map = data.get("stability_profile")
+    if isinstance(stability_map, dict):
+        _merge_tunable_block(merged, stability_map.get(stability_profile), f"stability_profile.{stability_profile}")
+
+    return merged
+
+
+def _override_float(
+    overrides: dict[str, Any],
+    key: str,
+    current: float,
+) -> float:
+    if key not in overrides:
+        return float(current)
+    value = overrides[key]
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Runtime tuning key '{key}' must be numeric, got {value!r}.") from exc
+
+
+def _override_array(
+    overrides: dict[str, Any],
+    key: str,
+    current: np.ndarray,
+) -> np.ndarray:
+    if key not in overrides:
+        return current
+    value = np.asarray(overrides[key], dtype=float)
+    if value.shape != current.shape:
+        raise ValueError(
+            f"Runtime tuning key '{key}' must have shape {current.shape}, got {value.shape}."
+        )
+    return value.astype(float, copy=False)
+
+
+def _override_diag(
+    overrides: dict[str, Any],
+    key: str,
+    size: int,
+    current: np.ndarray,
+) -> np.ndarray:
+    if key not in overrides:
+        return current
+    diag = np.asarray(overrides[key], dtype=float).reshape(-1)
+    if diag.shape[0] != size:
+        raise ValueError(
+            f"Runtime tuning key '{key}' must have {size} entries, got {diag.shape[0]}."
+        )
+    return np.diag(diag.astype(float, copy=False))
 
 
 @dataclass(frozen=True)
@@ -183,6 +342,15 @@ class RuntimeConfig:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="MuJoCo wheel-on-stick viewer controller.")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help=(
+            "Optional runtime tuning YAML file. "
+            f"If omitted, auto-loads {DEFAULT_RUNTIME_CONFIG_PATH.as_posix()} when present."
+        ),
+    )
     parser.add_argument(
         "--controller-family",
         choices=[
@@ -964,6 +1132,83 @@ def build_config(args) -> RuntimeConfig:
         high_spin_counter_min_frac = 0.20
         high_spin_base_authority_min = 0.60
         wheel_to_base_bias_gain = 0.70
+
+    runtime_overrides = _resolve_runtime_tuning_overrides(
+        getattr(args, "config", None),
+        mode=("smooth" if smooth_viewer else "robust"),
+        preset=preset,
+        stability_profile=stability_profile,
+    )
+    qx = _override_diag(runtime_overrides, "qx_diag", 9, qx)
+    qu = _override_diag(runtime_overrides, "qu_diag", 3, qu)
+    r_du = _override_diag(runtime_overrides, "r_du_diag", 3, r_du)
+    max_u = _override_array(runtime_overrides, "max_u", max_u)
+    max_du = _override_array(runtime_overrides, "max_du", max_du)
+    ki_base = _override_float(runtime_overrides, "ki_base", ki_base)
+    u_bleed = _override_float(runtime_overrides, "u_bleed", u_bleed)
+    wheel_momentum_thresh_frac = _override_float(
+        runtime_overrides, "wheel_momentum_thresh_frac", wheel_momentum_thresh_frac
+    )
+    wheel_momentum_k = _override_float(runtime_overrides, "wheel_momentum_k", wheel_momentum_k)
+    wheel_momentum_upright_k = _override_float(
+        runtime_overrides, "wheel_momentum_upright_k", wheel_momentum_upright_k
+    )
+    wheel_spin_budget_frac = _override_float(runtime_overrides, "wheel_spin_budget_frac", wheel_spin_budget_frac)
+    wheel_spin_hard_frac = _override_float(runtime_overrides, "wheel_spin_hard_frac", wheel_spin_hard_frac)
+    wheel_spin_budget_abs_rad_s = _override_float(
+        runtime_overrides, "wheel_spin_budget_abs_rad_s", wheel_spin_budget_abs_rad_s
+    )
+    wheel_spin_hard_abs_rad_s = _override_float(runtime_overrides, "wheel_spin_hard_abs_rad_s", wheel_spin_hard_abs_rad_s)
+    high_spin_exit_frac = _override_float(runtime_overrides, "high_spin_exit_frac", high_spin_exit_frac)
+    high_spin_counter_min_frac = _override_float(
+        runtime_overrides, "high_spin_counter_min_frac", high_spin_counter_min_frac
+    )
+    high_spin_base_authority_min = _override_float(
+        runtime_overrides, "high_spin_base_authority_min", high_spin_base_authority_min
+    )
+    wheel_to_base_bias_gain = _override_float(runtime_overrides, "wheel_to_base_bias_gain", wheel_to_base_bias_gain)
+    recovery_wheel_despin_scale = _override_float(
+        runtime_overrides, "recovery_wheel_despin_scale", recovery_wheel_despin_scale
+    )
+    hold_wheel_despin_scale = _override_float(
+        runtime_overrides, "hold_wheel_despin_scale", hold_wheel_despin_scale
+    )
+    base_force_soft_limit = _override_float(runtime_overrides, "base_force_soft_limit", base_force_soft_limit)
+    base_damping_gain = _override_float(runtime_overrides, "base_damping_gain", base_damping_gain)
+    base_centering_gain = _override_float(runtime_overrides, "base_centering_gain", base_centering_gain)
+    base_tilt_deadband_deg = _override_float(runtime_overrides, "base_tilt_deadband_deg", base_tilt_deadband_deg)
+    base_tilt_full_authority_deg = _override_float(
+        runtime_overrides, "base_tilt_full_authority_deg", base_tilt_full_authority_deg
+    )
+    base_command_gain = _override_float(runtime_overrides, "base_command_gain", base_command_gain)
+    base_centering_pos_clip_m = _override_float(
+        runtime_overrides, "base_centering_pos_clip_m", base_centering_pos_clip_m
+    )
+    base_speed_soft_limit_frac = _override_float(
+        runtime_overrides, "base_speed_soft_limit_frac", base_speed_soft_limit_frac
+    )
+    base_hold_radius_m = _override_float(runtime_overrides, "base_hold_radius_m", base_hold_radius_m)
+    base_ref_follow_rate_hz = _override_float(runtime_overrides, "base_ref_follow_rate_hz", base_ref_follow_rate_hz)
+    base_ref_recenter_rate_hz = _override_float(
+        runtime_overrides, "base_ref_recenter_rate_hz", base_ref_recenter_rate_hz
+    )
+    base_authority_rate_per_s = _override_float(
+        runtime_overrides, "base_authority_rate_per_s", base_authority_rate_per_s
+    )
+    base_command_lpf_hz = _override_float(runtime_overrides, "base_command_lpf_hz", base_command_lpf_hz)
+    upright_base_du_scale = _override_float(runtime_overrides, "upright_base_du_scale", upright_base_du_scale)
+    base_pitch_kp = _override_float(runtime_overrides, "base_pitch_kp", base_pitch_kp)
+    base_pitch_kd = _override_float(runtime_overrides, "base_pitch_kd", base_pitch_kd)
+    base_roll_kp = _override_float(runtime_overrides, "base_roll_kp", base_roll_kp)
+    base_roll_kd = _override_float(runtime_overrides, "base_roll_kd", base_roll_kd)
+    wheel_only_pitch_kp = _override_float(runtime_overrides, "wheel_only_pitch_kp", wheel_only_pitch_kp)
+    wheel_only_pitch_kd = _override_float(runtime_overrides, "wheel_only_pitch_kd", wheel_only_pitch_kd)
+    wheel_only_pitch_ki = _override_float(runtime_overrides, "wheel_only_pitch_ki", wheel_only_pitch_ki)
+    wheel_only_wheel_rate_kd = _override_float(
+        runtime_overrides, "wheel_only_wheel_rate_kd", wheel_only_wheel_rate_kd
+    )
+    wheel_only_max_u = _override_float(runtime_overrides, "wheel_only_max_u", wheel_only_max_u)
+    wheel_only_max_du = _override_float(runtime_overrides, "wheel_only_max_du", wheel_only_max_du)
 
     # Disturbance injection is disabled to avoid non-deterministic external pushes.
     disturbance_magnitude = 0.0

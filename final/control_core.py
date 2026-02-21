@@ -682,19 +682,18 @@ def compute_control_command(
         # Restore deadband-based blending: hold mode (position centering) at small angles, 
         # balance mode (pitch stabilization) at larger angles
         tilt_mag = max(abs(float(x_est[0])), abs(float(x_est[1])))
-        tilt_span = 0.10  # 5.7 degrees
-        base_tilt_deadband_rad = 0.40 * np.pi / 180  # 0.4 degrees (0.00698 rad)
-        base_authority_raw = float(np.clip((tilt_mag - base_tilt_deadband_rad) / tilt_span, 0.0, 1.0))
-        # Smooth authority with first-order filter
-        base_authority_tau = 0.1  # 100ms time constant
-        base_authority_alpha = float(np.clip(control_dt / (base_authority_tau + control_dt), 0.0, 1.0))
-        if not hasattr(compute_control_command, '_base_authority_filtered'):
-            compute_control_command._base_authority_filtered = 0.0
-        compute_control_command._base_authority_filtered = (
-            base_authority_alpha * base_authority_raw + 
-            (1.0 - base_authority_alpha) * compute_control_command._base_authority_filtered
-        )
-        base_authority = float(np.clip(compute_control_command._base_authority_filtered, 0.0, 1.0))
+        tilt_span = max(float(cfg.base_tilt_full_authority_rad - cfg.base_tilt_deadband_rad), 1e-6)
+        base_authority_raw = float(np.clip((tilt_mag - cfg.base_tilt_deadband_rad) / tilt_span, 0.0, 1.0))
+        # Rate-limit authority changes to avoid abrupt mode shifts.
+        base_rate = float(max(cfg.base_authority_rate_per_s, 0.0))
+        if base_rate > 0.0:
+            max_step = base_rate * control_dt
+            base_authority_state = float(
+                base_authority_state + np.clip(base_authority_raw - base_authority_state, -max_step, max_step)
+            )
+        else:
+            base_authority_state = base_authority_raw
+        base_authority = float(np.clip(base_authority_state, 0.0, 1.0))
         
         follow_alpha = float(np.clip(cfg.base_ref_follow_rate_hz * control_dt, 0.0, 1.0))
         recenter_alpha = float(np.clip(cfg.base_ref_recenter_rate_hz * control_dt, 0.0, 1.0))

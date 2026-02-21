@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  parity-and-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MUJOCO_GL: egl
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest osqp matplotlib pyyaml
+
+      - name: Run export parity tests
+        run: |
+          python -m pytest final/test_export_parity.py final/test_firmware_scenario_parity.py -q
+
+      - name: Run fast benchmark smoke profile
+        run: |
+          python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 2000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
