@@ -1,0 +1,61 @@
+{
+  "schema_version": "protocol_v1",
+  "seed": 42,
+  "benchmark_profile": "fast_pr",
+  "compare_modes": "default-vs-low-spin-robust",
+  "mode_matrix": [
+    [
+      "mode_default",
+      "default",
+      "default"
+    ],
+    [
+      "mode_low_spin_robust",
+      "default",
+      "low-spin-robust"
+    ]
+  ],
+  "controller_families": [
+    "current"
+  ],
+  "model_variants": [
+    "nominal",
+    "inertia_plus",
+    "friction_low",
+    "com_shift"
+  ],
+  "domain_profiles": [
+    "default",
+    "rand_light",
+    "rand_medium"
+  ],
+  "release_campaign": false,
+  "gates": {
+    "max_worst_tilt": 20.0,
+    "max_worst_base": 4.0,
+    "max_sat_du": 0.98,
+    "max_sat_abs": 0.9
+  },
+  "noise": {
+    "imu_angle_noise_deg": 0.25,
+    "imu_rate_noise": 0.02,
+    "wheel_rate_noise": 0.01
+  },
+  "dob": {
+    "cutoff_hz_for_current_dob": 5.0
+  },
+  "timing": {
+    "control_hz": 250.0,
+    "control_delay_steps": 1,
+    "hardware_realistic": true
+  },
+  "disturbance": {
+    "xy": 4.0,
+    "z": 2.0,
+    "interval": 300
+  },
+  "statistics": {
+    "alpha": 0.05,
+    "multiple_comparison_correction": "holm"
+  }
+}

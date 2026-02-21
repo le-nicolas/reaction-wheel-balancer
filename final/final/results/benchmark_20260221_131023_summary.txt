@@ -1,0 +1,53 @@
+OBJECTIVE=crash-rate
+
+BASELINE BY MODE/FAMILY
+mode_default/current/com_shift/default: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-301.473 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/com_shift/rand_light: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-300.120 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/com_shift/rand_medium: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-297.878 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/friction_low/default: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-294.577 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/friction_low/rand_light: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-292.309 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/friction_low/rand_medium: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-290.324 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/inertia_plus/default: preset=default stability_profile=default survival=0.000 crash_rate=1.000 score=-1000000000.000 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/inertia_plus/rand_light: preset=default stability_profile=default survival=0.000 crash_rate=1.000 score=-1000000000.000 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/inertia_plus/rand_medium: preset=default stability_profile=default survival=0.000 crash_rate=1.000 score=-1000000000.000 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/nominal/default: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-313.777 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/nominal/rand_light: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-316.629 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_default/current/nominal/rand_medium: preset=default stability_profile=default survival=1.000 crash_rate=0.000 score=-314.123 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_low_spin_robust/current/com_shift/default: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-59.226 wheel_over_budget=230.500 wheel_over_hard=0.000
+mode_low_spin_robust/current/com_shift/rand_light: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-60.198 wheel_over_budget=229.250 wheel_over_hard=0.000
+mode_low_spin_robust/current/com_shift/rand_medium: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-59.979 wheel_over_budget=229.000 wheel_over_hard=0.000
+mode_low_spin_robust/current/friction_low/default: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-128.284 wheel_over_budget=219.125 wheel_over_hard=0.000
+mode_low_spin_robust/current/friction_low/rand_light: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-127.687 wheel_over_budget=214.500 wheel_over_hard=0.000
+mode_low_spin_robust/current/friction_low/rand_medium: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-127.795 wheel_over_budget=212.000 wheel_over_hard=0.000
+mode_low_spin_robust/current/inertia_plus/default: preset=default stability_profile=low-spin-robust survival=0.000 crash_rate=1.000 score=-1000000000.000 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_low_spin_robust/current/inertia_plus/rand_light: preset=default stability_profile=low-spin-robust survival=0.000 crash_rate=1.000 score=-1000000000.000 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_low_spin_robust/current/inertia_plus/rand_medium: preset=default stability_profile=low-spin-robust survival=0.000 crash_rate=1.000 score=-1000000000.000 wheel_over_budget=0.000 wheel_over_hard=0.000
+mode_low_spin_robust/current/nominal/default: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-272.638 wheel_over_budget=8.750 wheel_over_hard=0.000
+mode_low_spin_robust/current/nominal/rand_light: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-270.136 wheel_over_budget=8.625 wheel_over_hard=0.000
+mode_low_spin_robust/current/nominal/rand_medium: preset=default stability_profile=low-spin-robust survival=1.000 crash_rate=0.000 score=-267.353 wheel_over_budget=8.500 wheel_over_hard=0.000
+
+TOP ACCEPTED PER MODE/FAMILY
+mode_default/current/com_shift/default: no accepted candidate, fallback=trial_002 survival=1.000 reason=gate_sat_du
+mode_default/current/com_shift/rand_light: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_default/current/com_shift/rand_medium: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_default/current/friction_low/default: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_default/current/friction_low/rand_light: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_default/current/friction_low/rand_medium: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_default/current/inertia_plus/default: no accepted candidate, fallback=trial_002 survival=1.000 reason=gate_sat_du
+mode_default/current/inertia_plus/rand_light: no accepted candidate, fallback=trial_002 survival=1.000 reason=gate_sat_du
+mode_default/current/inertia_plus/rand_medium: no accepted candidate, fallback=trial_002 survival=1.000 reason=gate_sat_du
+mode_default/current/nominal/default: trial_005 survival=1.000 crash_rate=0.000 score=-18.033 worst_tilt=5.856deg wheel_over_budget=0.000 wheel_over_hard=0.000 p=0.0000 p_corr=0.0000 promotion_pass=False release_verdict=False tier=exploratory
+mode_default/current/nominal/rand_light: trial_005 survival=1.000 crash_rate=0.000 score=-19.658 worst_tilt=5.856deg wheel_over_budget=0.000 wheel_over_hard=0.000 p=0.0000 p_corr=0.0000 promotion_pass=False release_verdict=False tier=exploratory
+mode_default/current/nominal/rand_medium: trial_005 survival=1.000 crash_rate=0.000 score=-20.849 worst_tilt=5.856deg wheel_over_budget=0.000 wheel_over_hard=0.000 p=0.0000 p_corr=0.0000 promotion_pass=False release_verdict=False tier=exploratory
+mode_low_spin_robust/current/com_shift/default: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/com_shift/rand_light: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/com_shift/rand_medium: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/friction_low/default: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/friction_low/rand_light: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/friction_low/rand_medium: no accepted candidate, fallback=trial_014 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/inertia_plus/default: no accepted candidate, fallback=trial_002 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/inertia_plus/rand_light: no accepted candidate, fallback=trial_002 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/inertia_plus/rand_medium: no accepted candidate, fallback=trial_002 survival=1.000 reason=gate_sat_du
+mode_low_spin_robust/current/nominal/default: trial_014 survival=1.000 crash_rate=0.000 score=12.863 worst_tilt=5.862deg wheel_over_budget=0.000 wheel_over_hard=0.000 p=0.0000 p_corr=0.0000 promotion_pass=False release_verdict=False tier=exploratory
+mode_low_spin_robust/current/nominal/rand_light: trial_014 survival=1.000 crash_rate=0.000 score=11.560 worst_tilt=5.862deg wheel_over_budget=0.000 wheel_over_hard=0.000 p=0.0000 p_corr=0.0000 promotion_pass=False release_verdict=False tier=exploratory
+mode_low_spin_robust/current/nominal/rand_medium: trial_005 survival=1.000 crash_rate=0.000 score=-10.060 worst_tilt=5.855deg wheel_over_budget=0.000 wheel_over_hard=0.000 p=0.0000 p_corr=0.0000 promotion_pass=False release_verdict=False tier=exploratory
