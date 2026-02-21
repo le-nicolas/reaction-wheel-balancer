@@ -96,6 +96,24 @@ def parse_args():
     parser.add_argument("--stress-level", choices=["fast", "medium", "long"], default="long")
     parser.add_argument("--init-angle-deg", type=float, default=4.0)
     parser.add_argument("--init-base-pos-m", type=float, default=0.15)
+    parser.add_argument(
+        "--payload-mass",
+        type=float,
+        default=0.0,
+        help="Physical payload mass attached on top of the stick (kg).",
+    )
+    parser.add_argument(
+        "--payload-support-radius-m",
+        type=float,
+        default=0.145,
+        help="Support polygon radius for payload COM overload checks (m).",
+    )
+    parser.add_argument(
+        "--payload-com-fail-steps",
+        type=int,
+        default=15,
+        help="Consecutive over-support steps required to flag payload overload crash.",
+    )
     parser.add_argument("--disturbance-xy", type=float, default=4.0)
     parser.add_argument("--disturbance-z", type=float, default=2.0)
     parser.add_argument("--disturbance-interval", type=int, default=300)
@@ -191,6 +209,11 @@ def build_protocol_manifest(args, mode_matrix, controller_families, model_varian
             "xy": float(args.disturbance_xy),
             "z": float(args.disturbance_z),
             "interval": int(args.disturbance_interval),
+        },
+        "payload": {
+            "mass_kg": float(args.payload_mass),
+            "support_radius_m": float(args.payload_support_radius_m),
+            "com_fail_steps": int(args.payload_com_fail_steps),
         },
         "statistics": {
             "alpha": float(args.significance_alpha),
@@ -1005,6 +1028,9 @@ def main():
         max_worst_base_m=args.gate_max_worst_base,
         max_mean_sat_rate_du=args.gate_max_sat_du,
         max_mean_sat_rate_abs=args.gate_max_sat_abs,
+        payload_mass_kg=float(args.payload_mass),
+        payload_support_radius_m=float(args.payload_support_radius_m),
+        payload_com_fail_steps=int(args.payload_com_fail_steps),
         control_hz=args.control_hz,
         control_delay_steps=args.control_delay_steps,
         hardware_realistic=not args.legacy_model,
@@ -1041,6 +1067,15 @@ def main():
             f"control_hz={args.control_hz:.1f}, "
             f"delay_steps={args.control_delay_steps}, "
             f"wheel_ticks={args.wheel_encoder_ticks}"
+        ),
+        flush=True,
+    )
+    print(
+        (
+            "Payload model: "
+            f"mass_kg={float(args.payload_mass):.3f}, "
+            f"support_radius_m={float(args.payload_support_radius_m):.3f}, "
+            f"com_fail_steps={int(args.payload_com_fail_steps)}"
         ),
         flush=True,
     )
@@ -1082,6 +1117,9 @@ def main():
                         max_worst_base_m=args.gate_max_worst_base,
                         max_mean_sat_rate_du=args.gate_max_sat_du,
                         max_mean_sat_rate_abs=args.gate_max_sat_abs,
+                        payload_mass_kg=float(args.payload_mass),
+                        payload_support_radius_m=float(args.payload_support_radius_m),
+                        payload_com_fail_steps=int(args.payload_com_fail_steps),
                         control_hz=args.control_hz,
                         control_delay_steps=args.control_delay_steps,
                         hardware_realistic=not args.legacy_model,

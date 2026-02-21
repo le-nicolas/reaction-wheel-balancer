@@ -24,6 +24,7 @@ It is written for two audiences:
 - `docs/`: workflow and analysis documentation.
 - `archive/`: legacy prototypes and historical logs moved out of the root.
 - `archive/legacy/scripts/README.md`: per-script intent map for archived iteration files.
+- `archive/investigations/model_integrity/`: one-off investigation scripts from the 2026-02-21 structural bug analysis.
 - `web/`: browser viewer side quest.
 - `wheel-base-controller-release/`: standalone minimal wheel-and-base package snapshot.
 
@@ -31,6 +32,7 @@ It is written for two audiences:
 
 - This repo is an active research/dev sandbox, not a frozen release.
 - The only actively maintained control stack is under `final/`.
+- The repository root is intentionally minimal; runnable/project scripts live under `final/` and archived investigations live under `archive/`.
 - Historical files/prototypes are retained in `archive/` for traceability, not as recommended entry points.
 - Legacy script intents are indexed in `archive/legacy/scripts/README.md` so canonical vs historical files are explicit.
 - The benchmark table in this README (`2026-02-21` snapshot) is a reproducible reference point, not a claim that all newer stress cases are solved.

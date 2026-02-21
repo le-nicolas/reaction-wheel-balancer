@@ -10,6 +10,7 @@ import numpy as np
 from scipy.linalg import LinAlgError, solve_discrete_are
 import runtime_config as runtime_cfg
 from mpc_controller import MPCController
+from runtime_model import compute_robot_com_distance_xy
 
 
 @dataclass
@@ -70,6 +71,9 @@ class EpisodeConfig:
     domain_profile_id: str = "default"
     hardware_replay: bool = False
     hardware_trace_path: str | None = None
+    payload_mass_kg: float = 0.0
+    payload_support_radius_m: float = 0.145
+    payload_com_fail_steps: int = 15
 
 
 class ControllerEvaluator:
@@ -231,7 +235,8 @@ class ControllerEvaluator:
         self.dt = self.model.opt.timestep
 
         self._runtime_cfg_cache: dict[tuple[object, ...], runtime_cfg.RuntimeConfig] = {}
-        self._linearization_cache: dict[tuple[float, float], tuple[np.ndarray, np.ndarray]] = {}
+        self._linearization_cache: dict[tuple[float, float, float], tuple[np.ndarray, np.ndarray]] = {}
+        self._active_payload_mass_kg = 0.0
         self._sync_runtime_tuning(self._resolve_runtime_cfg(EpisodeConfig()))
         self._resolve_ids()
         self.A, self.B = self._linearize()
@@ -261,6 +266,9 @@ class ControllerEvaluator:
             round(float(config.dob_cutoff_hz), 8),
             round(float(config.linearize_pitch_deg), 8),
             round(float(config.linearize_roll_deg), 8),
+            round(float(config.payload_mass_kg), 8),
+            round(float(config.payload_support_radius_m), 8),
+            int(config.payload_com_fail_steps),
         )
         cached = self._runtime_cfg_cache.get(key)
         if cached is not None:
@@ -301,6 +309,12 @@ class ControllerEvaluator:
             f"{float(config.linearize_pitch_deg)}",
             "--linearize-roll-deg",
             f"{float(config.linearize_roll_deg)}",
+            "--payload-mass",
+            f"{float(config.payload_mass_kg)}",
+            "--payload-support-radius-m",
+            f"{float(config.payload_support_radius_m)}",
+            "--payload-com-fail-steps",
+            str(int(config.payload_com_fail_steps)),
             "--controller-family",
             controller_family,
         ]
@@ -418,6 +432,23 @@ class ControllerEvaluator:
         self.aid_base_x = aid("base_x_force")
         self.aid_base_y = aid("base_y_force")
         self.stick_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "stick")
+        self.base_y_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "base_y")
+        self.payload_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "payload")
+        self.payload_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "payload_geom")
+
+    def _set_payload_mass(self, payload_mass_kg: float) -> float:
+        if self.payload_body_id < 0 or self.payload_geom_id < 0:
+            return 0.0
+        mass_target = float(max(payload_mass_kg, 0.0))
+        mass_runtime = max(mass_target, 1e-6)
+        sx, sy, sz = self.model.geom_size[self.payload_geom_id, :3]
+        ixx = (mass_runtime / 3.0) * (sy * sy + sz * sz)
+        iyy = (mass_runtime / 3.0) * (sx * sx + sz * sz)
+        izz = (mass_runtime / 3.0) * (sx * sx + sy * sy)
+        self.model.body_mass[self.payload_body_id] = mass_runtime
+        self.model.body_inertia[self.payload_body_id, :] = np.array([ixx, iyy, izz], dtype=float)
+        mujoco.mj_setConst(self.model, self.data)
+        return mass_target
 
     def _enforce_planar_root_attitude(self, do_forward: bool = True) -> None:
         # Keep the free-joint attitude upright to remove unmodeled tumble drift.
@@ -464,7 +495,11 @@ class ControllerEvaluator:
         return A, B
 
     def _resolve_linearization(self, pitch_rad: float, roll_rad: float) -> tuple[np.ndarray, np.ndarray]:
-        key = (round(float(pitch_rad), 8), round(float(roll_rad), 8))
+        key = (
+            round(float(pitch_rad), 8),
+            round(float(roll_rad), 8),
+            round(float(self._active_payload_mass_kg), 8),
+        )
         cached = self._linearization_cache.get(key)
         if cached is not None:
             return cached
@@ -622,6 +657,10 @@ class ControllerEvaluator:
         collect_filter_error_stats: bool = False,
     ) -> Dict[str, float]:
         rng = np.random.default_rng(episode_seed)
+        payload_mass_kg = self._set_payload_mass(config.payload_mass_kg)
+        if abs(payload_mass_kg - self._active_payload_mass_kg) > 1e-12:
+            self._active_payload_mass_kg = payload_mass_kg
+            self._linearization_cache.clear()
         runtime_cfg_for_episode = self._resolve_runtime_cfg(config)
         self._sync_runtime_tuning(runtime_cfg_for_episode)
         A_base, B_base = self._resolve_linearization(self.LINEARIZE_PITCH_RAD, self.LINEARIZE_ROLL_RAD)
@@ -702,6 +741,11 @@ class ControllerEvaluator:
         filter_err_pitch_samples: List[float] = []
         filter_err_pitch_ctrl_samples: List[float] = []
         true_pitch_samples: List[float] = []
+        support_radius_m = float(max(runtime_cfg_for_episode.payload_support_radius_m, 1e-6))
+        payload_com_fail_steps = int(max(runtime_cfg_for_episode.payload_com_fail_steps, 1))
+        com_over_support_steps = 0
+        com_fail_streak = 0
+        com_fail_streak_max = 0
 
         family = str(getattr(config, "controller_family", "current"))
         low_spin_robust = (config.stability_profile == "low-spin-robust") and family in ("current", "current_dob", "hybrid_modern")
@@ -1328,6 +1372,14 @@ class ControllerEvaluator:
             wheel_rate_now = float(self.data.qvel[self.v_rw])
             pitch_failed = abs(pitch) >= tilt_fail_rad
             roll_failed = abs(roll) >= tilt_fail_rad
+            com_planar_dist = compute_robot_com_distance_xy(self.model, self.data, self.base_y_body_id)
+            if com_planar_dist > support_radius_m:
+                com_over_support_steps += 1
+                com_fail_streak += 1
+            else:
+                com_fail_streak = 0
+            com_fail_streak_max = max(com_fail_streak_max, com_fail_streak)
+            com_failed = com_fail_streak >= payload_com_fail_steps
 
             pitch_crash_confirmed = False
             pitch_crash_reason = "pitch_tilt"
@@ -1351,9 +1403,12 @@ class ControllerEvaluator:
             else:
                 pitch_recovery_deadline_step = None
 
-            if pitch_crash_confirmed or roll_failed:
+            if pitch_crash_confirmed or roll_failed or com_failed:
                 crash_step = step
-                crash_reason = pitch_crash_reason if pitch_crash_confirmed else "roll_tilt"
+                if com_failed:
+                    crash_reason = "payload_com_over_support"
+                else:
+                    crash_reason = pitch_crash_reason if pitch_crash_confirmed else "roll_tilt"
                 crash_pitch_rate_rad_s = pitch_rate_now
                 crash_roll_rate_rad_s = roll_rate_now
                 crash_wheel_rate_rad_s = wheel_rate_now
@@ -1405,6 +1460,9 @@ class ControllerEvaluator:
             "max_abs_roll_deg": float(np.degrees(max_roll)),
             "max_abs_base_x_m": max_base_x,
             "max_abs_base_y_m": max_base_y,
+            "payload_mass_kg": float(payload_mass_kg),
+            "com_over_support_ratio": float(com_over_support_steps / max(steps_run, 1)),
+            "com_fail_streak_max": float(com_fail_streak_max),
             "rms_base_drift_m": float(np.sqrt(drift_sq_acc / max(steps_run, 1))),
             "control_energy": control_energy / max(steps_run, 1),
             "mean_command_jerk": command_jerk_acc / updates_run,
@@ -1491,6 +1549,9 @@ class ControllerEvaluator:
         mean_osc_band = float(np.mean([m["osc_band_energy"] for m in per_episode]))
         mean_sat_abs = float(np.mean([m["sat_rate_abs"] for m in per_episode]))
         mean_sat_du = float(np.mean([m["sat_rate_du"] for m in per_episode]))
+        mean_com_over_support_ratio = float(np.mean([m.get("com_over_support_ratio", 0.0) for m in per_episode]))
+        com_fail_streak_max = float(np.max([m.get("com_fail_streak_max", 0.0) for m in per_episode]))
+        payload_mass_kg = float(np.mean([m.get("payload_mass_kg", 0.0) for m in per_episode]))
         phase_switch_count_mean = float(np.mean([m["phase_switch_count"] for m in per_episode]))
         hold_phase_ratio_mean = float(np.mean([m["hold_phase_ratio"] for m in per_episode]))
         wheel_over_budget_mean = float(np.mean([m["wheel_over_budget"] for m in per_episode]))
@@ -1570,6 +1631,9 @@ class ControllerEvaluator:
             "mean_osc_band_energy": mean_osc_band,
             "mean_sat_rate_abs": mean_sat_abs,
             "mean_sat_rate_du": mean_sat_du,
+            "mean_com_over_support_ratio": mean_com_over_support_ratio,
+            "com_fail_streak_max": com_fail_streak_max,
+            "payload_mass_kg": payload_mass_kg,
             "phase_switch_count_mean": phase_switch_count_mean,
             "hold_phase_ratio_mean": hold_phase_ratio_mean,
             "wheel_over_budget_mean": wheel_over_budget_mean,
@@ -1717,6 +1781,9 @@ def safe_evaluate_candidate(
             "mean_osc_band_energy": np.nan,
             "mean_sat_rate_abs": np.nan,
             "mean_sat_rate_du": np.nan,
+            "mean_com_over_support_ratio": np.nan,
+            "com_fail_streak_max": np.nan,
+            "payload_mass_kg": np.nan,
             "phase_switch_count_mean": 0.0,
             "hold_phase_ratio_mean": 0.0,
             "wheel_over_budget_mean": 0.0,

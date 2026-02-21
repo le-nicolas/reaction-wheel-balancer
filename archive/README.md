@@ -6,6 +6,7 @@ This directory stores historical artifacts that are not part of the active runti
 
 - `archive/legacy/scripts/`: early prototype controllers and experiments.
 - `archive/legacy/scripts/README.md`: per-script purpose/index for legacy experiments.
+- `archive/investigations/model_integrity/`: focused diagnostics used during the 2026-02-21 model-structure investigation.
 - `archive/legacy/models/`: MuJoCo XML models used by legacy scripts.
 - `archive/logs/`: historical run logs moved out of the repository root.
 - `archive/text_outputs/`: older plain-text outputs and diagnostics.
