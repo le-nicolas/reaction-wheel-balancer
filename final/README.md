@@ -17,6 +17,7 @@ The goal of this README is to explain:
 | `final/control_core.py` | Main control law and safety shaping (LQR path and MPC path). |
 | `final/runtime_config.py` | All runtime parameters and CLI flags. |
 | `final/config.yaml` | Central tuning file for wheel/base saturation policy and other runtime overrides. |
+| `final/adaptive_id.py` | Online RLS system-ID and adaptive LQR gain scheduler. |
 | `final/runtime_model.py` | Model IDs, reset logic, estimator, COM distance checks, root-attitude clamp helpers. |
 | `final/mpc_controller.py` | Constrained MPC solver (OSQP/scipy fallback). |
 | `final/controller_eval.py` | Headless evaluator used by benchmarking/tuning scripts. |
@@ -310,6 +311,20 @@ For tuning visibility, run with:
 
 ```powershell
 python final/final.py --mode robust --enable-dob --enable-gain-scheduling --log-control-terms --trace-events-csv final/results/runtime_trace_dob.csv
+```
+
+### 5.8 Online ID + Adaptive LQR Gain Scheduling
+
+Optional runtime adaptation for payload/plant drift:
+
+1. RLS estimates effective pitch stiffness and control authority from telemetry.
+2. Adapted `A/B` rows are rebuilt from those estimates.
+3. `K_du` is recomputed every N control updates with blend/rate limits.
+
+Example:
+
+```powershell
+python final/final.py --mode robust --enable-online-id --online-id-recompute-every 25 --online-id-min-updates 60
 ```
 
 ## 6) Rebuild From Scratch (Recommended Path)

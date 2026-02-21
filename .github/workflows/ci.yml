@@ -31,7 +31,7 @@ jobs:
 
       - name: Run export parity tests
         run: |
-          python -m pytest final/test_export_parity.py final/test_firmware_scenario_parity.py -q
+          python -m pytest final/test_export_parity.py final/test_firmware_scenario_parity.py final/test_online_id_adaptive.py -q
 
       - name: Run fast benchmark smoke profile
         run: |

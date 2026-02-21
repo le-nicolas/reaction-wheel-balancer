@@ -119,6 +119,7 @@ python final/plot_paper_vs_sim.py --csv final/results/benchmark_20260216_011044.
 Runtime stack:
 - state estimation: linear Kalman correction from noisy channels
 - control core: delta-u LQR with controller-family-specific shaping
+- optional online ID + adaptive LQR scheduling: RLS estimates effective pitch stiffness/control authority and periodically refreshes `K`
 - optional adaptive disturbance observer + gain scheduling: estimate unknown additive disturbances and scale stabilizing gains in real time
 - optional residual correction: offline PyTorch model adds bounded `delta_u` to nominal command
 - safety shaping: saturation and rate limits, wheel-speed budget/high-spin logic, strict hard-speed same-direction suppression, base-authority gating, crash-angle handling (centrally tunable in `final/config.yaml`)
@@ -201,6 +202,11 @@ Robust profile:
 python final/final.py --mode robust --stability-profile low-spin-robust
 ```
 
+Adaptive online-ID profile (payload variation hardening):
+```bash
+python final/final.py --mode robust --enable-online-id --online-id-recompute-every 25 --online-id-min-updates 60
+```
+
 Controller family selection:
 ```bash
 python final/final.py --mode smooth --controller-family current
@@ -248,6 +254,7 @@ Files:
 
 - Main runtime: `final/final.py`
 - MuJoCo model: `final/final.xml`
+- Online ID scheduler: `final/adaptive_id.py`
 - Evaluator: `final/controller_eval.py`
 - Benchmark driver: `final/benchmark.py`
 - Sim-to-real sensitivity summarizer: `final/sim2real_sensitivity.py`

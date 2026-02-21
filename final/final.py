@@ -36,6 +36,7 @@ from control_core import (
     wheel_command_with_limits,
 )
 from residual_model import ResidualPolicy
+from adaptive_id import AdaptiveGainScheduler
 
 """
 Teaching-oriented MuJoCo balancing controller.
@@ -187,6 +188,20 @@ def main():
     # 4) Build estimator model from configured sensor channels/noise.
     control_steps = 1 if not cfg.hardware_realistic else max(1, int(round(1.0 / (model.opt.timestep * cfg.control_hz))))
     control_dt = control_steps * model.opt.timestep
+    adaptive_scheduler = None
+    adaptive_prev_x_est = None
+    if (
+        cfg.online_id_enabled
+        and (not cfg.use_mpc)
+        and (cfg.controller_family in {"current", "hybrid_modern"})
+        and (not cfg.wheel_only)
+    ):
+        adaptive_scheduler = AdaptiveGainScheduler(
+            cfg=cfg,
+            a_nominal=A,
+            b_nominal=B,
+            control_dt=control_dt,
+        )
     wheel_lsb = (2.0 * np.pi) / (cfg.wheel_encoder_ticks_per_rev * control_dt)
     wheel_budget_speed = min(cfg.wheel_spin_budget_frac * cfg.max_wheel_speed_rad_s, cfg.wheel_spin_budget_abs_rad_s)
     wheel_hard_speed = min(cfg.wheel_spin_hard_frac * cfg.max_wheel_speed_rad_s, cfg.wheel_spin_hard_abs_rad_s)
@@ -440,6 +455,21 @@ def main():
             f"rate={cfg.gain_schedule_rate_per_s:.2f}/s "
             f"weights={cfg.gain_schedule_weights}"
         )
+    print("\n=== ONLINE ID + ADAPTIVE LQR ===")
+    print(f"online_id_enabled={cfg.online_id_enabled}")
+    if cfg.online_id_enabled:
+        if adaptive_scheduler is None:
+            print("online_id_status=disabled_for_current_mode")
+        else:
+            print(
+                "online_id_params: "
+                f"forget={cfg.online_id_forgetting:.6f} "
+                f"recompute_every={cfg.online_id_recompute_every} "
+                f"min_updates={cfg.online_id_min_updates} "
+                f"g_scale=[{cfg.online_id_gravity_scale_min:.2f},{cfg.online_id_gravity_scale_max:.2f}] "
+                f"i_inv_scale=[{cfg.online_id_inertia_inv_scale_min:.2f},{cfg.online_id_inertia_inv_scale_max:.2f}] "
+                f"blend={cfg.online_id_gain_blend_alpha:.2f}"
+            )
     print(f"Initial Y-direction tilt (roll): {args.initial_y_tilt_deg:.2f} deg")
     print(
         "Payload: "
@@ -678,6 +708,7 @@ def main():
                 dob_hat[:] = 0.0
                 dob_raw[:] = 0.0
                 dob_prev_x_est = None
+                adaptive_prev_x_est = None
                 gain_schedule_scale_state = 1.0
                 pitch_recovery_deadline_step = None
                 reset_sensor_frontend_state(sensor_frontend_state)
@@ -745,6 +776,22 @@ def main():
                     dob_hat[:] = 0.0
                     dob_raw[:] = 0.0
                     gain_schedule_scale_state = 1.0
+                if adaptive_scheduler is not None:
+                    K_du, k_updated = adaptive_scheduler.maybe_update_gain(
+                        x_prev=adaptive_prev_x_est,
+                        u_prev=u_eff_applied,
+                        x_curr=x_est,
+                        k_current=K_du,
+                    )
+                    if cfg.online_id_verbose and k_updated:
+                        s = adaptive_scheduler.stats
+                        print(
+                            f"[online-id] update={control_updates} "
+                            f"g_scale={s.gravity_scale:.3f} "
+                            f"i_inv_scale={s.inertia_inv_scale:.3f} "
+                            f"rls_updates={s.rls_updates} "
+                            f"gain_recomputes={s.gain_recomputes}"
+                        )
                 (
                     u_cmd,
                     base_int,
@@ -782,6 +829,7 @@ def main():
                     mpc_controller=mpc_controller,
                 )
                 dob_prev_x_est = x_est.copy()
+                adaptive_prev_x_est = x_est.copy()
                 dob_disturbance_level_max = max(dob_disturbance_level_max, disturbance_level)
                 gain_schedule_scale_max = max(gain_schedule_scale_max, gain_schedule_scale_state)
                 gain_schedule_scale_accum += gain_schedule_scale_state
@@ -1102,6 +1150,7 @@ def main():
                 dob_hat[:] = 0.0
                 dob_raw[:] = 0.0
                 dob_prev_x_est = None
+                adaptive_prev_x_est = None
                 gain_schedule_scale_state = 1.0
                 pitch_recovery_deadline_step = None
                 reset_sensor_frontend_state(sensor_frontend_state)
@@ -1161,6 +1210,21 @@ def main():
     if cfg.gain_schedule_enabled:
         print(f"Gain schedule max scale: {gain_schedule_scale_max:.3f}")
         print(f"Gain schedule mean scale: {gain_schedule_scale_accum / denom:.3f}")
+    if adaptive_scheduler is not None:
+        s = adaptive_scheduler.stats
+        print(
+            "Online ID stats: "
+            f"rls_updates={s.rls_updates} "
+            f"skipped={s.rls_skipped} "
+            f"gain_recomputes={s.gain_recomputes} "
+            f"gain_failures={s.gain_recompute_failures}"
+        )
+        print(
+            "Online ID estimates: "
+            f"gravity_scale={s.gravity_scale:.3f} "
+            f"inertia_inv_scale={s.inertia_inv_scale:.3f} "
+            f"innovation_rms={s.innovation_rms:.4f}"
+        )
     print(f"Residual applied rate [updates]: {residual_applied_count / denom:.3f}")
     print(f"Residual clipped count: {residual_clipped_count}")
     print(f"Residual gate-blocked count: {residual_gate_blocked_count}")

@@ -1,5 +1,6 @@
 # Runtime tuning overrides loaded by final/runtime_config.py.
 # Layer order: global -> mode.<smooth|robust> -> preset.<...> -> stability_profile.<...>
+# Use CLI `--enable-online-id` to activate adaptive scheduling; this file tunes its numeric limits.
 #
 # Optional advanced tuning keys (commented by default):
 # global:
@@ -10,6 +11,10 @@
 #   max_du: [10.0, 0.45, 0.45]
 #   ki_base: 1.6
 #   u_bleed: 0.94
+#   online_id_forgetting: 0.995
+#   online_id_init_cov: 500.0
+#   online_id_recompute_every: 25
+#   online_id_min_updates: 60
 
 global:
   wheel_momentum_thresh_frac: 0.35
@@ -25,6 +30,19 @@ global:
   wheel_to_base_bias_gain: 0.35
   recovery_wheel_despin_scale: 0.45
   hold_wheel_despin_scale: 1.0
+  online_id_forgetting: 0.995
+  online_id_init_cov: 500.0
+  online_id_min_excitation: 0.015
+  online_id_recompute_every: 25
+  online_id_min_updates: 60
+  online_id_gravity_scale_min: 0.55
+  online_id_gravity_scale_max: 1.80
+  online_id_inertia_inv_scale_min: 0.45
+  online_id_inertia_inv_scale_max: 2.20
+  online_id_scale_rate_per_s: 0.60
+  online_id_gain_blend_alpha: 0.18
+  online_id_gain_max_delta: 0.35
+  online_id_innovation_clip: 4.0
 
 mode:
   smooth:

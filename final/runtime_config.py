@@ -57,6 +57,19 @@ TUNABLE_KEYS = {
     "wheel_only_wheel_rate_kd",
     "wheel_only_max_u",
     "wheel_only_max_du",
+    "online_id_forgetting",
+    "online_id_init_cov",
+    "online_id_min_excitation",
+    "online_id_recompute_every",
+    "online_id_min_updates",
+    "online_id_gravity_scale_min",
+    "online_id_gravity_scale_max",
+    "online_id_inertia_inv_scale_min",
+    "online_id_inertia_inv_scale_max",
+    "online_id_scale_rate_per_s",
+    "online_id_gain_blend_alpha",
+    "online_id_gain_max_delta",
+    "online_id_innovation_clip",
 }
 
 
@@ -161,6 +174,20 @@ def _override_diag(
             f"Runtime tuning key '{key}' must have {size} entries, got {diag.shape[0]}."
         )
     return np.diag(diag.astype(float, copy=False))
+
+
+def _override_int(
+    overrides: dict[str, Any],
+    key: str,
+    current: int,
+) -> int:
+    if key not in overrides:
+        return int(current)
+    value = overrides[key]
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Runtime tuning key '{key}' must be integer-compatible, got {value!r}.") from exc
 
 
 @dataclass(frozen=True)
@@ -311,6 +338,21 @@ class RuntimeConfig:
     wheel_only_max_u: float
     wheel_only_max_du: float
     wheel_only_int_clamp: float
+    online_id_enabled: bool
+    online_id_forgetting: float
+    online_id_init_cov: float
+    online_id_min_excitation: float
+    online_id_recompute_every: int
+    online_id_min_updates: int
+    online_id_gravity_scale_min: float
+    online_id_gravity_scale_max: float
+    online_id_inertia_inv_scale_min: float
+    online_id_inertia_inv_scale_max: float
+    online_id_scale_rate_per_s: float
+    online_id_gain_blend_alpha: float
+    online_id_gain_max_delta: float
+    online_id_innovation_clip: float
+    online_id_verbose: bool
     use_mpc: bool
     mpc_horizon: int
     mpc_q_angles: float
@@ -509,6 +551,96 @@ def parse_args(argv=None):
         type=float,
         default=0.6,
         help="Disturbance weighting for base-y channel in schedule magnitude.",
+    )
+    parser.add_argument(
+        "--enable-online-id",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable online system identification + adaptive gain-scheduled LQR updates.",
+    )
+    parser.add_argument(
+        "--online-id-forgetting",
+        type=float,
+        default=0.995,
+        help="RLS forgetting factor (close to 1.0 keeps longer memory).",
+    )
+    parser.add_argument(
+        "--online-id-init-cov",
+        type=float,
+        default=500.0,
+        help="Initial covariance for RLS parameter uncertainty.",
+    )
+    parser.add_argument(
+        "--online-id-min-excitation",
+        type=float,
+        default=0.015,
+        help="Minimum feature norm required before an RLS update is accepted.",
+    )
+    parser.add_argument(
+        "--online-id-recompute-every",
+        type=int,
+        default=25,
+        help="Recompute adaptive LQR gain every N control updates.",
+    )
+    parser.add_argument(
+        "--online-id-min-updates",
+        type=int,
+        default=60,
+        help="Minimum accepted RLS updates before enabling adaptive gain recompute.",
+    )
+    parser.add_argument(
+        "--online-id-gravity-scale-min",
+        type=float,
+        default=0.55,
+        help="Lower bound on estimated gravity-stiffness scaling.",
+    )
+    parser.add_argument(
+        "--online-id-gravity-scale-max",
+        type=float,
+        default=1.80,
+        help="Upper bound on estimated gravity-stiffness scaling.",
+    )
+    parser.add_argument(
+        "--online-id-inertia-inv-scale-min",
+        type=float,
+        default=0.45,
+        help="Lower bound on estimated inverse-inertia scaling.",
+    )
+    parser.add_argument(
+        "--online-id-inertia-inv-scale-max",
+        type=float,
+        default=2.20,
+        help="Upper bound on estimated inverse-inertia scaling.",
+    )
+    parser.add_argument(
+        "--online-id-scale-rate-per-s",
+        type=float,
+        default=0.60,
+        help="Rate limit for adaptive scale changes (1/s).",
+    )
+    parser.add_argument(
+        "--online-id-gain-blend-alpha",
+        type=float,
+        default=0.18,
+        help="Blend factor when applying newly solved adaptive gain matrix.",
+    )
+    parser.add_argument(
+        "--online-id-gain-max-delta",
+        type=float,
+        default=0.35,
+        help="Per-entry absolute clip for each adaptive gain matrix update step.",
+    )
+    parser.add_argument(
+        "--online-id-innovation-clip",
+        type=float,
+        default=4.0,
+        help="Absolute clip limit for RLS innovation term.",
+    )
+    parser.add_argument(
+        "--online-id-verbose",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print adaptive-ID diagnostics periodically.",
     )
     parser.add_argument(
         "--preset",
@@ -1133,6 +1265,26 @@ def build_config(args) -> RuntimeConfig:
         high_spin_base_authority_min = 0.60
         wheel_to_base_bias_gain = 0.70
 
+    online_id_enabled = bool(getattr(args, "enable_online_id", False))
+    online_id_forgetting = float(max(getattr(args, "online_id_forgetting", 0.995), 0.90))
+    online_id_init_cov = float(max(getattr(args, "online_id_init_cov", 500.0), 1.0))
+    online_id_min_excitation = float(max(getattr(args, "online_id_min_excitation", 0.015), 1e-6))
+    online_id_recompute_every = int(max(getattr(args, "online_id_recompute_every", 25), 1))
+    online_id_min_updates = int(max(getattr(args, "online_id_min_updates", 60), 1))
+    online_id_gravity_scale_min = float(max(getattr(args, "online_id_gravity_scale_min", 0.55), 0.05))
+    online_id_gravity_scale_max = float(
+        max(getattr(args, "online_id_gravity_scale_max", 1.80), online_id_gravity_scale_min + 1e-6)
+    )
+    online_id_inertia_inv_scale_min = float(max(getattr(args, "online_id_inertia_inv_scale_min", 0.45), 0.05))
+    online_id_inertia_inv_scale_max = float(
+        max(getattr(args, "online_id_inertia_inv_scale_max", 2.20), online_id_inertia_inv_scale_min + 1e-6)
+    )
+    online_id_scale_rate_per_s = float(max(getattr(args, "online_id_scale_rate_per_s", 0.60), 0.0))
+    online_id_gain_blend_alpha = float(np.clip(getattr(args, "online_id_gain_blend_alpha", 0.18), 0.0, 1.0))
+    online_id_gain_max_delta = float(max(getattr(args, "online_id_gain_max_delta", 0.35), 0.0))
+    online_id_innovation_clip = float(max(getattr(args, "online_id_innovation_clip", 4.0), 1e-6))
+    online_id_verbose = bool(getattr(args, "online_id_verbose", False))
+
     runtime_overrides = _resolve_runtime_tuning_overrides(
         getattr(args, "config", None),
         mode=("smooth" if smooth_viewer else "robust"),
@@ -1209,6 +1361,47 @@ def build_config(args) -> RuntimeConfig:
     )
     wheel_only_max_u = _override_float(runtime_overrides, "wheel_only_max_u", wheel_only_max_u)
     wheel_only_max_du = _override_float(runtime_overrides, "wheel_only_max_du", wheel_only_max_du)
+    online_id_forgetting = _override_float(runtime_overrides, "online_id_forgetting", online_id_forgetting)
+    online_id_init_cov = _override_float(runtime_overrides, "online_id_init_cov", online_id_init_cov)
+    online_id_min_excitation = _override_float(runtime_overrides, "online_id_min_excitation", online_id_min_excitation)
+    online_id_recompute_every = _override_int(runtime_overrides, "online_id_recompute_every", online_id_recompute_every)
+    online_id_min_updates = _override_int(runtime_overrides, "online_id_min_updates", online_id_min_updates)
+    online_id_gravity_scale_min = _override_float(
+        runtime_overrides, "online_id_gravity_scale_min", online_id_gravity_scale_min
+    )
+    online_id_gravity_scale_max = _override_float(
+        runtime_overrides, "online_id_gravity_scale_max", online_id_gravity_scale_max
+    )
+    online_id_inertia_inv_scale_min = _override_float(
+        runtime_overrides, "online_id_inertia_inv_scale_min", online_id_inertia_inv_scale_min
+    )
+    online_id_inertia_inv_scale_max = _override_float(
+        runtime_overrides, "online_id_inertia_inv_scale_max", online_id_inertia_inv_scale_max
+    )
+    online_id_scale_rate_per_s = _override_float(
+        runtime_overrides, "online_id_scale_rate_per_s", online_id_scale_rate_per_s
+    )
+    online_id_gain_blend_alpha = _override_float(
+        runtime_overrides, "online_id_gain_blend_alpha", online_id_gain_blend_alpha
+    )
+    online_id_gain_max_delta = _override_float(runtime_overrides, "online_id_gain_max_delta", online_id_gain_max_delta)
+    online_id_innovation_clip = _override_float(
+        runtime_overrides, "online_id_innovation_clip", online_id_innovation_clip
+    )
+
+    online_id_forgetting = float(np.clip(online_id_forgetting, 0.90, 0.999999))
+    online_id_init_cov = float(max(online_id_init_cov, 1.0))
+    online_id_min_excitation = float(max(online_id_min_excitation, 1e-6))
+    online_id_recompute_every = int(max(online_id_recompute_every, 1))
+    online_id_min_updates = int(max(online_id_min_updates, 1))
+    online_id_gravity_scale_min = float(max(online_id_gravity_scale_min, 0.05))
+    online_id_gravity_scale_max = float(max(online_id_gravity_scale_max, online_id_gravity_scale_min + 1e-6))
+    online_id_inertia_inv_scale_min = float(max(online_id_inertia_inv_scale_min, 0.05))
+    online_id_inertia_inv_scale_max = float(max(online_id_inertia_inv_scale_max, online_id_inertia_inv_scale_min + 1e-6))
+    online_id_scale_rate_per_s = float(max(online_id_scale_rate_per_s, 0.0))
+    online_id_gain_blend_alpha = float(np.clip(online_id_gain_blend_alpha, 0.0, 1.0))
+    online_id_gain_max_delta = float(max(online_id_gain_max_delta, 0.0))
+    online_id_innovation_clip = float(max(online_id_innovation_clip, 1e-6))
 
     # Disturbance injection is disabled to avoid non-deterministic external pushes.
     disturbance_magnitude = 0.0
@@ -1290,6 +1483,10 @@ def build_config(args) -> RuntimeConfig:
         wheel_only_wheel_rate_kd = min(wheel_only_wheel_rate_kd, 0.05)
         wheel_only_max_u = min(wheel_only_max_u, 2.5)
         wheel_only_max_du = min(wheel_only_max_du, 0.15)
+
+    if hardware_safe or real_hardware_profile:
+        # Keep adaptation disabled during conservative hardware bring-up.
+        online_id_enabled = False
 
     crash_divergence_gate_enabled = bool(getattr(args, "crash_gate_divergence", True))
     crash_recovery_window_steps = max(int(getattr(args, "crash_recovery_steps", 500)), 0)
@@ -1532,6 +1729,21 @@ def build_config(args) -> RuntimeConfig:
         wheel_only_max_u=wheel_only_max_u,
         wheel_only_max_du=wheel_only_max_du,
         wheel_only_int_clamp=0.35,
+        online_id_enabled=online_id_enabled,
+        online_id_forgetting=online_id_forgetting,
+        online_id_init_cov=online_id_init_cov,
+        online_id_min_excitation=online_id_min_excitation,
+        online_id_recompute_every=online_id_recompute_every,
+        online_id_min_updates=online_id_min_updates,
+        online_id_gravity_scale_min=online_id_gravity_scale_min,
+        online_id_gravity_scale_max=online_id_gravity_scale_max,
+        online_id_inertia_inv_scale_min=online_id_inertia_inv_scale_min,
+        online_id_inertia_inv_scale_max=online_id_inertia_inv_scale_max,
+        online_id_scale_rate_per_s=online_id_scale_rate_per_s,
+        online_id_gain_blend_alpha=online_id_gain_blend_alpha,
+        online_id_gain_max_delta=online_id_gain_max_delta,
+        online_id_innovation_clip=online_id_innovation_clip,
+        online_id_verbose=online_id_verbose,
         use_mpc=bool(getattr(args, "use_mpc", False)),
         mpc_horizon=int(max(getattr(args, "mpc_horizon", 32), 5)),
         mpc_q_angles=float(max(getattr(args, "mpc_q_angles", 280.0), 1.0)),
