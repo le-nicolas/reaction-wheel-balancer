@@ -181,7 +181,10 @@ def update_disturbance_observer(
     if (d_raw.shape[0] != 3) or (not np.all(np.isfinite(d_raw))):
         return np.zeros(3, dtype=float), np.zeros(3, dtype=float)
 
-    alpha = float(np.clip(cfg.dob_gain * control_dt, 0.0, 1.0))
+    # First-order Q-filter discretization (equivalent to LPF on residual).
+    gain = float(max(cfg.dob_gain, 0.0))
+    alpha = float(1.0 - np.exp(-gain * max(control_dt, 0.0)))
+    alpha = float(np.clip(alpha, 0.0, 1.0))
     dob_next = (1.0 - alpha) * dob_hat + alpha * d_raw
     leak = float(np.clip(cfg.dob_leak_per_s * control_dt, 0.0, 1.0))
     dob_next *= (1.0 - leak)
@@ -449,8 +452,10 @@ def compute_control_command(
         sat_hits[0] += int(abs(u_rw_raw) > cfg.max_u[0])
         sat_hits[1:] += (np.abs(u_base_raw) > cfg.max_u[1:]).astype(int)
 
-        # Return MPC result in same format as LQR path
+        # Return MPC result in same format as LQR path.
+        # DOB feed-forward is applied here as well so MPC can cancel estimated disturbances.
         u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
+        u_cmd = _apply_dob_compensation(cfg, u_cmd, sat_hits, terms, dob_compensation)
         rw_u_limit = cfg.max_u[0]
         wheel_over_budget = False  # MPC handles constraints explicitly
         wheel_over_hard = False

@@ -140,6 +140,7 @@ General effect:
 ### 2.2 Controller families in benchmark
 
 - `current`
+- `current_dob` (`current` + DOB feed-forward compensation)
 - `hybrid_modern`
 - `paper_split_baseline`
 - `baseline_mpc` (reference constrained-MPC baseline, intentionally kept without low-spin hardening add-ons)
@@ -170,7 +171,7 @@ Longer and harsher profiles can still separate controllers even when this fast s
 
 Benchmark command used for this snapshot:
 ```bash
-python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 2000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
+python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 2000 --trials 0 --controller-families current,current_dob,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
 ```
 
 Expected outputs:
@@ -213,6 +214,7 @@ python final/final.py --mode robust --enable-online-id --online-id-recompute-eve
 Controller family selection:
 ```bash
 python final/final.py --mode smooth --controller-family current
+python final/final.py --mode smooth --controller-family current_dob --dob-cutoff-hz 5.0
 python final/final.py --mode smooth --controller-family hybrid_modern
 python final/final.py --mode smooth --controller-family paper_split_baseline
 ```

@@ -35,4 +35,4 @@ jobs:
 
       - name: Run fast benchmark smoke profile
         run: |
-          python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 2000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
+          python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 2000 --trials 0 --controller-families current,current_dob,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced

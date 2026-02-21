@@ -73,7 +73,7 @@ Current gap to close:
 
 ```powershell
 # Fast benchmark snapshot
-python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 2000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
+python final/benchmark.py --benchmark-profile fast_pr --episodes 8 --steps 2000 --trials 0 --controller-families current,current_dob,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
 
 # Sensitivity summary from a benchmark CSV that includes variant/domain factors
 python final/sim2real_sensitivity.py --csv final/results/benchmark_20260215_215203.csv --out-prefix final/results/sim2real_sensitivity_20260215_215203_ref

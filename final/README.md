@@ -213,13 +213,14 @@ Runtime tuning:
 ```powershell
 python final/final.py --mode smooth
 python final/final.py --mode robust
+python final/final.py --mode robust --controller-family current_dob --dob-cutoff-hz 5.0
 python final/final.py --use-mpc --mode robust
 ```
 
 ### 5.3 Run Reproducible Benchmark (Headless)
 
 ```powershell
-python final/benchmark.py --benchmark-profile fast_pr --episodes 12 --steps 6000 --trials 0 --controller-families current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
+python final/benchmark.py --benchmark-profile fast_pr --episodes 12 --steps 6000 --trials 0 --controller-families current,current_dob,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like --model-variants nominal --domain-rand-profile default --compare-modes default-vs-low-spin-robust --primary-objective balanced
 ```
 
 Outputs are written to `final/results/`:
@@ -295,22 +296,26 @@ Detailed guide:
 
 ### 5.7 Adaptive Disturbance Observer + Gain Scheduling
 
-This feature is optional and targets LQR mode (`--use-mpc` off):
+This feature is optional and can run on both LQR and MPC paths:
 
 1. Disturbance observer estimates unknown additive input disturbances in actuator space (`rw`, `bx`, `by`).
 2. Compensation term subtracts that estimate from the command.
-3. Gain scheduling scales stabilization gains up under large estimated disturbance and back down in calm state.
+3. `--dob-cutoff-hz` is the primary Q-filter tuning knob (typical starting range: 3-8 Hz).
+4. Gain scheduling scales stabilization gains up under large estimated disturbance and back down in calm state (LQR shaping path).
 
 Example:
 
 ```powershell
-python final/final.py --mode robust --enable-dob --dob-gain 14 --dob-leak-per-s 0.6 --dob-max-rw 6.0 --dob-max-bx 1.0 --dob-max-by 1.0 --enable-gain-scheduling --gain-sched-min 1.0 --gain-sched-max 1.8 --gain-sched-ref 2.0 --gain-sched-rate-per-s 3.0
+python final/final.py --mode robust --controller-family current_dob --dob-cutoff-hz 5.0 --dob-leak-per-s 0.6 --dob-max-rw 6.0 --dob-max-bx 1.0 --dob-max-by 1.0 --enable-gain-scheduling --gain-sched-min 1.0 --gain-sched-max 1.8 --gain-sched-ref 2.0 --gain-sched-rate-per-s 3.0
+
+# MPC + DOB feed-forward
+python final/final.py --mode robust --use-mpc --enable-dob --dob-cutoff-hz 5.0 --dob-leak-per-s 0.6 --dob-max-rw 6.0 --dob-max-bx 1.0 --dob-max-by 1.0
 ```
 
 For tuning visibility, run with:
 
 ```powershell
-python final/final.py --mode robust --enable-dob --enable-gain-scheduling --log-control-terms --trace-events-csv final/results/runtime_trace_dob.csv
+python final/final.py --mode robust --controller-family current_dob --dob-cutoff-hz 5.0 --enable-gain-scheduling --log-control-terms --trace-events-csv final/results/runtime_trace_dob.csv
 ```
 
 ### 5.8 Online ID + Adaptive LQR Gain Scheduling

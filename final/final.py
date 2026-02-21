@@ -193,7 +193,7 @@ def main():
     if (
         cfg.online_id_enabled
         and (not cfg.use_mpc)
-        and (cfg.controller_family in {"current", "hybrid_modern"})
+        and (cfg.controller_family in {"current", "current_dob", "hybrid_modern"})
         and (not cfg.wheel_only)
     ):
         adaptive_scheduler = AdaptiveGainScheduler(
@@ -441,9 +441,11 @@ def main():
     print("\n=== ADAPTIVE DISTURBANCE OBSERVER ===")
     print(f"dob_enabled={cfg.dob_enabled}")
     if cfg.dob_enabled:
+        dob_cutoff_hz_eff = float(cfg.dob_gain / (2.0 * np.pi)) if cfg.dob_gain > 0.0 else 0.0
         print(
             "dob_params: "
-            f"gain={cfg.dob_gain:.2f}/s leak={cfg.dob_leak_per_s:.2f}/s "
+            f"gain={cfg.dob_gain:.2f}/s cutoff~{dob_cutoff_hz_eff:.2f}Hz "
+            f"leak={cfg.dob_leak_per_s:.2f}/s "
             f"max_abs={cfg.dob_max_abs_u}"
         )
     print(f"gain_schedule_enabled={cfg.gain_schedule_enabled}")
@@ -486,8 +488,8 @@ def main():
     if cfg.real_hardware_profile:
         base_msg = "enabled" if cfg.allow_base_motion else "disabled (unlock required)"
         print(f"REAL-HARDWARE profile active: strict bring-up limits + forced stop_on_crash + base motion {base_msg}.")
-    if cfg.use_mpc and cfg.dob_enabled:
-        print("Note: DOb/gain scheduling are currently applied on LQR path; MPC mode keeps nominal MPC behavior.")
+    if cfg.use_mpc and cfg.gain_schedule_enabled:
+        print("Note: gain scheduling scales LQR terms only; MPC path currently uses DOB feed-forward without LQR gain scaling.")
 
     reset_state(model, data, ids.q_pitch, ids.q_roll, pitch_eq=0.0, roll_eq=initial_roll_rad)
     if cfg.lock_root_attitude:
@@ -750,7 +752,7 @@ def main():
                 if balance_phase == "recovery":
                     recovery_time_s += control_dt
                 disturbance_level = 0.0
-                if cfg.dob_enabled and (not cfg.use_mpc):
+                if cfg.dob_enabled:
                     dob_hat, dob_raw = update_disturbance_observer(
                         cfg=cfg,
                         A=A,

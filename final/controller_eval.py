@@ -63,6 +63,7 @@ class EpisodeConfig:
     preset: str = "default"
     stability_profile: str = "default"
     controller_family: str = "current"
+    dob_cutoff_hz: float = 5.0
     model_variant_id: str = "nominal"
     domain_profile_id: str = "default"
     hardware_replay: bool = False
@@ -240,10 +241,15 @@ class ControllerEvaluator:
             round(float(config.rw_emergency_pitch_deg), 8),
             round(float(config.rw_emergency_du_scale), 8),
             round(float(config.hold_base_x_centering_gain), 8),
+            round(float(config.dob_cutoff_hz), 8),
         )
         cached = self._runtime_cfg_cache.get(key)
         if cached is not None:
             return cached
+
+        controller_family = str(config.controller_family)
+        if controller_family not in {"current", "current_dob", "hybrid_modern", "paper_split_baseline"}:
+            controller_family = "current"
 
         argv = [
             "--mode",
@@ -273,14 +279,15 @@ class ControllerEvaluator:
             "--hold-base-x-centering-gain",
             f"{float(config.hold_base_x_centering_gain)}",
             "--controller-family",
-            (
-                str(config.controller_family)
-                if str(config.controller_family) in {"current", "hybrid_modern", "paper_split_baseline"}
-                else "current"
-            ),
+            controller_family,
         ]
         argv.append("--crash-gate-divergence" if bool(config.crash_divergence_gate) else "--no-crash-gate-divergence")
         argv.append("--rw-emergency-du" if bool(config.rw_emergency_du) else "--no-rw-emergency-du")
+        if controller_family == "current_dob":
+            argv.append("--enable-dob")
+            dob_cutoff_hz = float(max(config.dob_cutoff_hz, 0.0))
+            if dob_cutoff_hz > 0.0:
+                argv.extend(["--dob-cutoff-hz", f"{dob_cutoff_hz}"])
         if not config.hardware_realistic:
             argv.append("--legacy-model")
 
@@ -578,6 +585,7 @@ class ControllerEvaluator:
         noise_scale, timing_jitter_frac = self._domain_noise_scales(config.domain_profile_id)
         A_run = self.A * a_scale
         B_run = self.B * b_scale
+        B_run_pinv = np.linalg.pinv(B_run)
         runtime_cfg_for_episode = self._resolve_runtime_cfg(config)
         self._sync_runtime_tuning(runtime_cfg_for_episode)
 
@@ -607,6 +615,9 @@ class ControllerEvaluator:
         balance_phase = "recovery"
         recovery_time_s = 0.0
         high_spin_active = False
+        dob_hat = np.zeros(3, dtype=float)
+        dob_raw = np.zeros(3, dtype=float)
+        dob_prev_x_est: np.ndarray | None = None
         upright_blend = 0.0
         despin_gain = 0.25
         max_pitch = 0.0
@@ -641,7 +652,7 @@ class ControllerEvaluator:
         phase_switch_events: List[Dict[str, float | str]] = []
 
         family = str(getattr(config, "controller_family", "current"))
-        low_spin_robust = (config.stability_profile == "low-spin-robust") and family in ("current", "hybrid_modern")
+        low_spin_robust = (config.stability_profile == "low-spin-robust") and family in ("current", "current_dob", "hybrid_modern")
         legacy_family = family in ("legacy_wheel_pid", "legacy_wheel_lqr", "legacy_run_pd")
         paper_family = family == "paper_split_baseline"
         hybrid_family = family == "hybrid_modern"
@@ -777,6 +788,31 @@ class ControllerEvaluator:
                         )
                 if balance_phase == "recovery":
                     recovery_time_s += control_dt
+
+                if runtime_cfg_for_episode.dob_enabled:
+                    if dob_prev_x_est is None:
+                        dob_raw[:] = 0.0
+                    else:
+                        x_model = A_run @ dob_prev_x_est + B_run @ u_eff_applied
+                        state_residual = x_est - x_model
+                        dob_raw = B_run_pinv @ state_residual
+                        if (dob_raw.shape[0] != 3) or (not np.all(np.isfinite(dob_raw))):
+                            dob_hat[:] = 0.0
+                            dob_raw[:] = 0.0
+                        else:
+                            gain = float(max(runtime_cfg_for_episode.dob_gain, 0.0))
+                            alpha = float(1.0 - np.exp(-gain * max(control_dt, 0.0)))
+                            alpha = float(np.clip(alpha, 0.0, 1.0))
+                            dob_hat = (1.0 - alpha) * dob_hat + alpha * dob_raw
+                            leak = float(np.clip(runtime_cfg_for_episode.dob_leak_per_s * control_dt, 0.0, 1.0))
+                            dob_hat *= (1.0 - leak)
+                            dob_hat = np.clip(dob_hat, -runtime_cfg_for_episode.dob_max_abs_u, runtime_cfg_for_episode.dob_max_abs_u)
+                            if not np.all(np.isfinite(dob_hat)):
+                                dob_hat[:] = 0.0
+                                dob_raw[:] = 0.0
+                else:
+                    dob_hat[:] = 0.0
+                    dob_raw[:] = 0.0
 
                 z = np.concatenate([x_ctrl, u_eff_applied])
                 du_lqr = -k_du @ z
@@ -1022,6 +1058,10 @@ class ControllerEvaluator:
                 du_hits += int((abs(du_rw_cmd) > rw_du_limit) or np.any(np.abs(du_base_cmd) > base_du_limit))
                 sat_hits += int((abs(u_rw_unc) > self.MAX_U[0]) or np.any(np.abs(u_base_unc) > self.MAX_U[1:]))
                 u_cmd = np.array([u_rw_cmd, u_base_cmd[0], u_base_cmd[1]], dtype=float)
+                if runtime_cfg_for_episode.dob_enabled:
+                    u_cmd_dob = u_cmd - dob_hat
+                    sat_hits += int(np.any(np.abs(u_cmd_dob) > self.MAX_U))
+                    u_cmd = np.clip(u_cmd_dob, -self.MAX_U, self.MAX_U)
 
                 near_upright = (
                     abs(x_true[0]) < self.UPRIGHT_ANGLE_THRESH
@@ -1070,6 +1110,7 @@ class ControllerEvaluator:
                     u_applied = cmd_queue.popleft()
                 else:
                     u_applied = u_cmd
+                dob_prev_x_est = x_est.copy()
             if low_spin_robust and balance_phase == "hold":
                 hold_steps += 1
             if low_spin_robust and high_spin_active:

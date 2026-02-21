@@ -397,11 +397,12 @@ def parse_args(argv=None):
         "--controller-family",
         choices=[
             "current",
+            "current_dob",
             "hybrid_modern",
             "paper_split_baseline",
         ],
         default="current",
-        help="Controller family selector. 'current' preserves existing behavior.",
+        help="Controller family selector. 'current_dob' uses the current stack with DOB enabled.",
     )
     parser.add_argument(
         "--log-control-terms",
@@ -472,13 +473,19 @@ def parse_args(argv=None):
         "--enable-dob",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Enable adaptive disturbance observer (DOb) compensation on LQR path.",
+        help="Enable adaptive disturbance observer (DOb) feed-forward compensation.",
     )
     parser.add_argument(
         "--dob-gain",
         type=float,
         default=14.0,
         help="Observer adaptation gain (1/s) for disturbance estimate update.",
+    )
+    parser.add_argument(
+        "--dob-cutoff-hz",
+        type=float,
+        default=0.0,
+        help="If >0, sets DOB low-pass cutoff (Hz) and overrides --dob-gain via gain=2*pi*cutoff.",
     )
     parser.add_argument(
         "--dob-leak-per-s",
@@ -1089,6 +1096,7 @@ def parse_args(argv=None):
 
 
 def build_config(args) -> RuntimeConfig:
+    controller_family = str(getattr(args, "controller_family", "current"))
     preset = str(getattr(args, "preset", "default"))
     stability_profile = str(getattr(args, "stability_profile", "default"))
     stable_demo_profile = preset == "stable-demo"
@@ -1545,9 +1553,14 @@ def build_config(args) -> RuntimeConfig:
     residual_gate_rate_rad_s = float(max(float(getattr(args, "residual_gate_rate", 0.0)), 0.0))
     dob_enabled = bool(getattr(args, "enable_dob", False))
     gain_schedule_enabled = bool(getattr(args, "enable_gain_scheduling", False))
+    if controller_family == "current_dob":
+        dob_enabled = True
     if gain_schedule_enabled:
         dob_enabled = True
     dob_gain = float(max(float(getattr(args, "dob_gain", 14.0)), 0.0))
+    dob_cutoff_hz = float(max(float(getattr(args, "dob_cutoff_hz", 0.0)), 0.0))
+    if dob_cutoff_hz > 0.0:
+        dob_gain = float(2.0 * np.pi * dob_cutoff_hz)
     dob_leak_per_s = float(max(float(getattr(args, "dob_leak_per_s", 0.6)), 0.0))
     dob_max_abs_u = np.array(
         [
@@ -1579,7 +1592,7 @@ def build_config(args) -> RuntimeConfig:
     payload_com_fail_steps = int(max(getattr(args, "payload_com_fail_steps", 15), 1))
 
     return RuntimeConfig(
-        controller_family=str(getattr(args, "controller_family", "current")),
+        controller_family=controller_family,
         log_control_terms=bool(getattr(args, "log_control_terms", False)),
         control_terms_csv=getattr(args, "control_terms_csv", None),
         trace_events_csv=getattr(args, "trace_events_csv", None),

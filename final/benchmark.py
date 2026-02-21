@@ -22,7 +22,7 @@ MAX_DU_BASE_BOUNDS = (0.1, 20.0)
 NOVELTY_MIN_DISTANCE = 0.12
 NOVELTY_MAX_ATTEMPTS = 300
 DEFAULT_CONTROLLER_FAMILIES = (
-    "current,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like,legacy_wheel_pid,legacy_wheel_lqr,legacy_run_pd"
+    "current,current_dob,hybrid_modern,paper_split_baseline,baseline_mpc,baseline_robust_hinf_like,legacy_wheel_pid,legacy_wheel_lqr,legacy_run_pd"
 )
 DEFAULT_MODEL_VARIANTS = "nominal,inertia_plus,friction_low,com_shift"
 DEFAULT_DOMAIN_PROFILES = "default,rand_light,rand_medium"
@@ -109,6 +109,12 @@ def parse_args():
     parser.add_argument("--imu-angle-noise-deg", type=float, default=0.25)
     parser.add_argument("--imu-rate-noise", type=float, default=0.02)
     parser.add_argument("--wheel-rate-noise", type=float, default=0.01)
+    parser.add_argument(
+        "--dob-cutoff-hz",
+        type=float,
+        default=5.0,
+        help="DOB cutoff used by controller_family=current_dob (Hz).",
+    )
     parser.add_argument("--legacy-model", action="store_true", help="Disable hardware-realistic timing/noise model.")
     return parser.parse_args()
 
@@ -172,6 +178,9 @@ def build_protocol_manifest(args, mode_matrix, controller_families, model_varian
             "imu_angle_noise_deg": float(args.imu_angle_noise_deg),
             "imu_rate_noise": float(args.imu_rate_noise),
             "wheel_rate_noise": float(args.wheel_rate_noise),
+        },
+        "dob": {
+            "cutoff_hz_for_current_dob": float(args.dob_cutoff_hz),
         },
         "timing": {
             "control_hz": float(args.control_hz),
@@ -1006,6 +1015,7 @@ def main():
         preset=str(canonical_mode[1]),
         stability_profile=str(canonical_mode[2]),
         controller_family="current",
+        dob_cutoff_hz=args.dob_cutoff_hz,
         model_variant_id="nominal",
         domain_profile_id="default",
         hardware_replay=bool(args.hardware_trace_path),
@@ -1082,6 +1092,7 @@ def main():
                         preset=preset,
                         stability_profile=stability_profile,
                         controller_family=controller_family,
+                        dob_cutoff_hz=args.dob_cutoff_hz,
                         model_variant_id=model_variant,
                         domain_profile_id=domain_profile,
                         hardware_replay=bool(args.hardware_trace_path),
